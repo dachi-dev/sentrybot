@@ -185,7 +185,7 @@ async def main():
     )
     await scenario("critical category", csam, [FakeAttachment("x.png", (30, 30, 30))])
     await scenario(
-        "API outage, FAIL_MODE=closed", clean, [FakeAttachment("y.png", (80, 80, 80))],
+        "API outage → fail-open (no action)", clean, [FakeAttachment("y.png", (80, 80, 80))],
         raise_error=True,
     )
 
@@ -276,6 +276,37 @@ async def main():
     cases = sum(1 for e in EVENTS if e[0] == "review_post")
     print("\n=== attachment + embed both flagged ===")
     print(f"  cases opened (want 1): {cases}")
+
+    # confidence threshold: a low-confidence block is NOT quarantined when threshold high
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    low_gore = {"verdict": "block", "category": "gore", "confidence": 0.5, "reason": "maybe"}
+    NEXT_VERDICT.update(payload=low_gore)
+    NEXT_VERDICT["raise"] = False
+    guild = FakeGuild()
+    cfg = sentry.state.guild(guild.id)
+    cfg["review_channel"] = 77
+    cfg["restricted_role"] = 999
+    cfg["approved_hashes"] = []
+    cfg["blocked_hashes"] = {}
+    cfg["min_confidence"] = 0.90  # "high"
+    att = FakeAttachment("maybe.png", (100, 100, 20))
+    msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "borderline")
+    await sentry.process(msg, [att], cfg)
+    print("\n=== confidence threshold (block 0.50 vs threshold 0.90) ===")
+    print(f"  message deleted (want No): {msg.deleted}")
+
+    # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
+    _hp = sentry.HAS_PIL
+    sentry.HAS_PIL = False
+    gbuf = io.BytesIO()
+    gfr = [Image.new("RGB", (10, 10), (i * 30, 0, 0)) for i in range(2)]
+    gfr[0].save(gbuf, format="GIF", save_all=True, append_images=gfr[1:])
+    frames = sentry._extract_frames(gbuf.getvalue(), "image/png")  # declared png, is gif
+    sentry.HAS_PIL = _hp
+    print("\n=== media-type sniff (declared png, actual gif) ===")
+    print(f"  media_type (want image/gif): {frames[0][1] if frames else 'NONE'}")
 
 
 asyncio.run(main())

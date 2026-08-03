@@ -34,7 +34,8 @@ edit history. Single file, no database, ~800 input tokens per image.
 | Command | Purpose |
 |---|---|
 | `/sentry setup` | Choose the review channel (warns if @everyone can read it) |
-| `/sentry sensitivity` | `relaxed` / `standard` / `strict` |
+| `/sentry sensitivity` | `relaxed` / `standard` / `strict` (what Claude flags) |
+| `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |
@@ -130,9 +131,13 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   the real thing — so when a clean image does get caught, the **Approve** review button
   restores access, allow-lists the image, and tells the user they can repost it, keeping
   the cost of a mistake low.
-- **`SENTRY_FAIL_MODE=closed`** (default) deletes when the API errors. On a provider
-  outage that means every image in the server gets deleted — `open` is the safer default
-  for large servers, since a missed image is usually cheaper than mass false deletions.
+- **Failures never take action.** If the check can't complete (API outage, undecodable
+  or oversize file), the message is left up — an outage can't mass-delete content.
+- **Confidence threshold** (`/sentry threshold`) sets how sure Claude must be before an
+  image is quarantined: `low` (≥0.60), `medium` (≥0.75, default), `high` (≥0.90). Raise it
+  if you see false positives; lower it to catch more borderline cases. Suspected CSAM is
+  always removed regardless of the threshold. This is separate from **sensitivity**, which
+  changes *what* Claude flags; the threshold filters *how confident* a flag must be.
 - **Cost:** one Haiku call per image at ~800 input tokens, ~50 output. Identical
   re-uploads cost nothing: an in-memory cache covers the current session, and moderator
   decisions (both approvals and disapprovals) **persist to `sentry_state.json`**, so a

@@ -65,9 +65,11 @@ MAX_EDGE = int(os.getenv("SENTRY_MAX_EDGE", "768"))
 # Hard ceiling from the API: 5 MB per base64 image, 8000x8000 px.
 API_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
 
-# What to do when the check itself fails (API error, unsupported file, oversize).
-# "closed" = delete and open a case. "open" = leave the message up.
-FAIL_MODE = os.getenv("SENTRY_FAIL_MODE", "closed").lower()
+# Minimum Claude confidence (0-1) needed to quarantine a flagged image. A failed
+# check (API error, undecodable/oversize file) NEVER takes action — the message is
+# left up — so an outage or a weird file can't mass-delete content.
+CONFIDENCE_LEVELS = {"low": 0.60, "medium": 0.75, "high": 0.90}
+DEFAULT_MIN_CONFIDENCE = CONFIDENCE_LEVELS["medium"]
 
 MAX_CONCURRENT_CHECKS = int(os.getenv("SENTRY_CONCURRENCY", "4"))
 VERDICT_CACHE_SIZE = 512
@@ -110,6 +112,7 @@ class State:
                 "approved_hashes": [],  # sha256s a mod approved; never re-flagged
                 "blocked_hashes": {},  # sha256 -> verdict; reposts skip Claude
                 "approved_posts": {},  # sha256 -> [[channel_id, message_id]] reposts
+                "min_confidence": DEFAULT_MIN_CONFIDENCE,  # quarantine threshold
             },
         )
 
@@ -208,6 +211,20 @@ def _cache_put(key: str, value: dict) -> None:
 GIF_SAMPLE_FRAMES = max(1, int(os.getenv("SENTRY_GIF_FRAMES", "4")))
 
 
+def _sniff_mime(raw: bytes) -> str | None:
+    """The real image media type from magic bytes — the declared mime is unreliable
+    (embeds/stickers are guessed as png), and a wrong media_type makes the API 400."""
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
     """Return up to GIF_SAMPLE_FRAMES (base64_jpeg, media_type) sampled evenly across
     an image. Static images yield one frame; animated GIF/WebP/APNG yield several so a
@@ -235,9 +252,11 @@ def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
         except Exception:
             log.warning("pillow failed to decode image")
 
-    # No Pillow: fall back to the raw bytes as a single frame if the type is supported.
-    if mime in SUPPORTED_MIME and len(raw) <= API_IMAGE_BYTE_LIMIT * 0.7:
-        return [(base64.standard_b64encode(raw).decode(), mime)]
+    # PIL absent or it failed on this image: send the raw bytes as one frame, labeled
+    # by their ACTUAL sniffed format so a wrong media_type can't 400 the API.
+    media = _sniff_mime(raw) or (mime if mime in SUPPORTED_MIME else None)
+    if media in SUPPORTED_MIME and len(raw) <= API_IMAGE_BYTE_LIMIT * 0.7:
+        return [(base64.standard_b64encode(raw).decode(), media)]
     return []
 
 
@@ -281,7 +300,7 @@ async def _classify_one(data: str, media_type: str, sensitivity: str) -> dict:
     except Exception:
         log.exception("classification failed")
         return {
-            "verdict": "block" if FAIL_MODE == "closed" else "allow",
+            "verdict": "allow",  # fail open: a failed check never takes action
             "category": "check_failed",
             "confidence": 0.0,
             "reason": "moderation check errored",
@@ -299,9 +318,9 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
 
     frames = _extract_frames(raw, mime)
     if not frames:
-        # Not cached: an oversize/undecodable result shouldn't stick around.
+        # Fail open and don't cache: an undecodable/oversize file takes no action.
         return {
-            "verdict": "block" if FAIL_MODE == "closed" else "allow",
+            "verdict": "allow",
             "category": "unscannable",
             "confidence": 0.0,
             "reason": "file type or size not scannable",
@@ -314,8 +333,8 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
         if verdict.get("verdict") == "block":
             break  # one bad frame is enough
 
-    # Never cache a transient failure (e.g. an API outage under FAIL_MODE=closed),
-    # or a brief outage would keep deleting that image for the rest of the session.
+    # Never cache a transient failure, or a brief outage would keep returning it for
+    # the rest of the session.
     if not verdict.get("error"):
         _cache_put(cache_key, verdict)
     return verdict
@@ -994,13 +1013,22 @@ async def _run_moderation(
                         del lst[: len(lst) - 50]
         state.save()
 
+    # Quarantine a block only if it's confident enough — a failed check never acts,
+    # and suspected CSAM always acts regardless of the threshold.
+    min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
+
+    def _quarantine(v: dict) -> bool:
+        if v["verdict"] != "block" or v.get("error"):
+            return False
+        if v.get("category") == "minor_sexual":
+            return True
+        return v.get("confidence", 0) >= min_conf
+
     flagged = [
-        (name, raw, v)
-        for (name, _, raw), v in zip(payloads, results)
-        if v["verdict"] == "block"
+        (name, raw, v) for (name, _, raw), v in zip(payloads, results) if _quarantine(v)
     ]
     if not flagged:
-        return False  # clean: the message was never touched
+        return False  # clean, below the confidence threshold, or a failed check
 
     # A message is atomic — one bad item takes the whole message with it.
     try:
@@ -1012,30 +1040,19 @@ async def _run_moderation(
 
     worst = max(flagged, key=lambda f: f[2].get("confidence", 0))[2]
     critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
-    errored = all(f[2].get("error") for f in flagged)
-
-    restricted = False
-    if not errored:
-        restricted = await restrict(author, f"flagged: {worst.get('category')}")
+    restricted = await restrict(author, f"flagged: {worst.get('category')}")
 
     try:
-        if errored:
-            await author.send(
-                f"Your image in **{message.guild.name}** (#{channel}) was removed "
-                f"because the automated safety check could not complete. This is not a "
-                f"judgement about your image — please try posting it again shortly."
+        await author.send(
+            f"Your image in **{message.guild.name}** (#{channel}) was removed by "
+            f"automated moderation ({worst.get('category', 'flagged')}).\n"
+            + (
+                "Your permission to post images has been suspended pending review "
+                "by a server admin. If this was a mistake, a moderator can restore it."
+                if restricted
+                else "No action was taken on your account."
             )
-        else:
-            await author.send(
-                f"Your image in **{message.guild.name}** (#{channel}) was removed by "
-                f"automated moderation ({worst.get('category', 'flagged')}).\n"
-                + (
-                    "Your permission to post images has been suspended pending review "
-                    "by a server admin. If this was a mistake, a moderator can restore it."
-                    if restricted
-                    else "No action was taken on your account."
-                )
-            )
+        )
     except discord.Forbidden:
         pass
 
@@ -1194,6 +1211,31 @@ async def sensitivity_cmd(
     )
 
 
+@mod.command(
+    name="threshold",
+    description="How confident Claude must be before an image is quarantined",
+)
+@app_commands.choices(
+    level=[
+        app_commands.Choice(name="low — act even on shaky flags (0.60)", value="low"),
+        app_commands.Choice(name="medium — balanced (0.75)", value="medium"),
+        app_commands.Choice(name="high — only very confident flags (0.90)", value="high"),
+    ]
+)
+async def threshold_cmd(
+    interaction: discord.Interaction, level: app_commands.Choice[str]
+):
+    cfg = state.guild(interaction.guild.id)
+    cfg["min_confidence"] = CONFIDENCE_LEVELS[level.value]
+    state.save()
+    await interaction.response.send_message(
+        f"Quarantine threshold set to **{level.value}** "
+        f"(confidence ≥ {CONFIDENCE_LEVELS[level.value]:.2f}). "
+        f"Suspected CSAM is always removed regardless.",
+        ephemeral=True,
+    )
+
+
 @mod.command(name="exclude", description="Exclude a channel from scanning (or re-include it)")
 @app_commands.describe(
     channel="Channel to exclude from moderation",
@@ -1276,7 +1318,13 @@ async def status_cmd(interaction: discord.Interaction):
         value=", ".join(f"<#{c}>" for c in exempt) if exempt else "none",
         inline=False,
     )
-    embed.add_field(name="On check failure", value=FAIL_MODE, inline=True)
+    min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
+    level_name = next(
+        (k for k, v in CONFIDENCE_LEVELS.items() if v == min_conf), f"{min_conf:.2f}"
+    )
+    embed.add_field(
+        name="Quarantine threshold", value=f"{level_name} (≥ {min_conf:.2f})", inline=True
+    )
     embed.add_field(name="Downscale", value=f"{MAX_EDGE}px long edge", inline=True)
     embed.add_field(
         name="Remembered",
@@ -1321,7 +1369,16 @@ async def post_cmd(
         raw, image.content_type or "image/png", cfg.get("sensitivity", "standard")
     )
 
-    if verdict["verdict"] == "block":
+    min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
+    should_block = (
+        verdict["verdict"] == "block"
+        and not verdict.get("error")
+        and (
+            verdict.get("category") == "minor_sexual"
+            or verdict.get("confidence", 0) >= min_conf
+        )
+    )
+    if should_block:
         restricted = await restrict(
             interaction.user, f"flagged via /post: {verdict.get('category')}"
         )
