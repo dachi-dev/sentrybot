@@ -456,18 +456,13 @@ class ReviewView(discord.ui.View):
                     hashes.append(hashlib.sha256(await att.read()).hexdigest())
                 except Exception:
                     log.exception("could not read case attachment to approve")
+        # Add to the allow-list. We deliberately KEEP any disapproved-cache entry
+        # (the allow-list overrides it while approved), so that Undo approval instantly
+        # re-blocks the image with no fresh Claude call.
         cfg = state.guild(interaction.guild.id)
         approved = cfg.setdefault("approved_hashes", [])
-        blocked = cfg.setdefault("blocked_hashes", {})
-        changed = False
-        for h in hashes:
-            if h not in approved:
-                approved.append(h)
-                changed = True
-            if h in blocked:
-                del blocked[h]
-                changed = True
-        if changed:
+        if any(h not in approved for h in hashes):
+            approved.extend(h for h in hashes if h not in approved)
             state.save()
 
         try:
@@ -541,6 +536,43 @@ async def _resolve_member(
         return None
 
 
+async def _purge_image_from_channel(
+    guild: discord.Guild, channel_id: int | None, hashes: set[str], limit: int = 100
+) -> int:
+    """Best-effort: delete recent non-bot messages in a channel whose image
+    attachments match any of the given sha256s. Used to clean up a repost after an
+    approval is undone. Only scans the last `limit` messages."""
+    if not hashes or channel_id is None:
+        return 0
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return 0
+    deleted = 0
+    try:
+        async for msg in channel.history(limit=limit):
+            if msg.author.bot:
+                continue
+            match = False
+            for att in msg.attachments:
+                if not (att.content_type or "").startswith("image/"):
+                    continue
+                try:
+                    if hashlib.sha256(await att.read()).hexdigest() in hashes:
+                        match = True
+                        break
+                except Exception:
+                    continue
+            if match:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except discord.HTTPException:
+                    pass
+    except discord.Forbidden:
+        log.warning("cannot scan channel %s to remove reposts", channel_id)
+    return deleted
+
+
 async def _flip_restriction(
     interaction: discord.Interaction, *, restore: bool, first_time: bool
 ):
@@ -605,18 +637,28 @@ class UndoApprovalView(discord.ui.View):
         await interaction.response.defer()
         cfg = state.guild(interaction.guild.id)
         approved = cfg.setdefault("approved_hashes", [])
+        hashes = set(_case_hashes(interaction.message))
         removed = 0
-        for h in _case_hashes(interaction.message):
+        for h in list(hashes):
             if h in approved:
                 approved.remove(h)
                 removed += 1
+        # Removing from the allow-list re-activates the retained block-cache entry,
+        # so the image is disapproved again with no fresh Claude call.
         if removed:
             state.save()
+
+        # Delete any repost of the image already sitting in the origin channel.
+        deleted = await _purge_image_from_channel(
+            interaction.guild, _case_channel_id(interaction.message), hashes
+        )
+
         embed = interaction.message.embeds[0]
         embed.colour = discord.Colour.orange()
         embed.add_field(
             name="Approval reversed",
-            value=f"by {interaction.user.mention} — this image will be scanned again.",
+            value=f"by {interaction.user.mention} — image blocked again"
+            + (f"; deleted {deleted} repost(s)." if deleted else "."),
             inline=False,
         )
         await interaction.message.edit(embed=embed, view=discord.ui.View())

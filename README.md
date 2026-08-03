@@ -102,8 +102,10 @@ Three buttons:
   that exact image, by anyone — is not flagged again. (Without the allow-list, a repost
   would just be re-classified to the same verdict and removed in a loop.) The closed case
   keeps a single **Undo approval** button.
-- **Undo approval** (shown only after Approve) — removes the image from the allow-list via
-  the stored fingerprint, so it can be scanned again. No one has to re-handle the image.
+- **Undo approval** (shown only after Approve) — reverses the approval via the stored
+  fingerprint: the image is **blocked again** (any new post of it is deleted with no Claude
+  call), and any repost already sitting in the origin channel is **deleted** (best-effort
+  scan of the last 100 messages). No one has to re-handle the image.
 
 **Exception:** if Claude classifies something as sexual content involving a minor, the
 image is **not** re-uploaded to the review channel. The case carries metadata only, plus
