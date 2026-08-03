@@ -1194,16 +1194,33 @@ async def sensitivity_cmd(
     )
 
 
-@mod.command(name="exempt", description="Toggle scanning off/on for a channel")
-async def exempt_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+@mod.command(name="exclude", description="Exclude a channel from scanning (or re-include it)")
+@app_commands.describe(
+    channel="Channel to exclude from moderation",
+    action="Exclude it, or re-include it (default: exclude)",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="exclude — stop scanning this channel", value="exclude"),
+        app_commands.Choice(name="include — resume scanning this channel", value="include"),
+    ]
+)
+async def exclude_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    action: app_commands.Choice[str] | None = None,
+):
     cfg = state.guild(interaction.guild.id)
     exempt = cfg["exempt_channels"]
-    if channel.id in exempt:
-        exempt.remove(channel.id)
-        msg = f"Scanning re-enabled in {channel.mention}."
+    reinclude = action is not None and action.value == "include"
+    if reinclude:
+        if channel.id in exempt:
+            exempt.remove(channel.id)
+        msg = f"{channel.mention} will be **scanned** again."
     else:
-        exempt.append(channel.id)
-        msg = f"{channel.mention} is now exempt from scanning."
+        if channel.id not in exempt:
+            exempt.append(channel.id)
+        msg = f"{channel.mention} is now **excluded** from scanning."
     state.save()
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -1255,7 +1272,7 @@ async def status_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="Exempt channels",
+        name="Excluded channels",
         value=", ".join(f"<#{c}>" for c in exempt) if exempt else "none",
         inline=False,
     )

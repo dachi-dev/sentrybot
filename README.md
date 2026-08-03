@@ -35,7 +35,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 |---|---|
 | `/sentry setup` | Choose the review channel (warns if @everyone can read it) |
 | `/sentry sensitivity` | `relaxed` / `standard` / `strict` |
-| `/sentry exempt` | Toggle scanning off for one channel (NSFW channels, mod-only rooms) |
+| `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |
 | `/sentry restrict` / `unrestrict` | Manual permission control |
