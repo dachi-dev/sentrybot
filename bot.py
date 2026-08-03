@@ -408,10 +408,12 @@ class ReviewView(discord.ui.View):
         custom_id="sentry:restore",
     )
     async def restore(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id = _case_user_id(interaction.message)
-        member = interaction.guild.get_member(user_id) if user_id else None
+        await interaction.response.defer()
+        member = await _resolve_member(
+            interaction.guild, _case_user_id(interaction.message)
+        )
         if member is None:
-            await interaction.response.send_message("Member not found.", ephemeral=True)
+            await interaction.followup.send("Member not found.", ephemeral=True)
             return
         ok = await unrestrict(member, f"cleared by {interaction.user}")
         await _close_case(
@@ -420,6 +422,7 @@ class ReviewView(discord.ui.View):
             if ok
             else f"{interaction.user.mention} marked resolved (no active restriction).",
             discord.Colour.green(),
+            deferred=True,
         )
 
     @discord.ui.button(
@@ -443,15 +446,16 @@ class ReviewView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         """Restore access and re-post the cleared image to its origin channel."""
-        user_id = _case_user_id(interaction.message)
-        member = interaction.guild.get_member(user_id) if user_id else None
-        if member is None:
-            await interaction.response.send_message("Member not found.", ephemeral=True)
-            return
-
         # Re-posting means downloading and re-uploading the image, so acknowledge
         # the interaction first to avoid the 3s "did not respond" timeout.
         await interaction.response.defer()
+        member = await _resolve_member(
+            interaction.guild, _case_user_id(interaction.message)
+        )
+        if member is None:
+            await interaction.followup.send("Member not found.", ephemeral=True)
+            return
+
         await unrestrict(member, f"false positive cleared by {interaction.user}")
 
         channel_id = _case_channel_id(interaction.message)
@@ -526,6 +530,23 @@ def _case_user_id(message: discord.Message) -> int | None:
 
 def _case_channel_id(message: discord.Message) -> int | None:
     return _case_field(message, "Origin")
+
+
+async def _resolve_member(
+    guild: discord.Guild, user_id: int | None
+) -> discord.Member | None:
+    """get_member reads only the local cache, which is unreliable without the
+    privileged members intent, so buttons would spuriously report "Member not
+    found." Fall back to a REST fetch, which works regardless of cache."""
+    if user_id is None:
+        return None
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except discord.HTTPException:
+        return None
 
 
 async def _close_case(
