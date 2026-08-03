@@ -246,5 +246,36 @@ async def main():
     print(f"  api calls (want 0)         : {len(CALLS)}")
     print(f"  message deleted (want Yes) : {msg.deleted}")
 
+    # a message with BOTH a flagged attachment and a flagged embed opens ONE case,
+    # not two (the attachment pass deletes it, so the embed pass must be skipped)
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    sentry.embed_scanned.clear()
+    NEXT_VERDICT.update(payload=gore)
+    NEXT_VERDICT["raise"] = False
+    guild = FakeGuild()
+    cfg = sentry.state.guild(guild.id)
+    cfg["review_channel"] = 77
+    cfg["restricted_role"] = 999
+    cfg["approved_hashes"] = []
+    cfg["blocked_hashes"] = {}
+    att = FakeAttachment("both.png", (150, 20, 20))
+    msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "look")
+    msg.stickers = []
+    msg.embeds = [SimpleNamespace()]  # non-empty so the embed path is considered
+    _png = io.BytesIO()
+    Image.new("RGB", (48, 48), (9, 9, 9)).save(_png, format="PNG")
+
+    async def _fake_fetch(url):
+        return _png.getvalue()
+
+    sentry._embed_image_urls = lambda m: [("embed0.img", "http://x/e.png")]
+    sentry._fetch_image_bytes = _fake_fetch
+    await sentry._scan_created(msg, cfg)
+    cases = sum(1 for e in EVENTS if e[0] == "review_post")
+    print("\n=== attachment + embed both flagged ===")
+    print(f"  cases opened (want 1): {cases}")
+
 
 asyncio.run(main())

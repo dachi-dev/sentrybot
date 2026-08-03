@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import re
-import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -300,15 +299,14 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
 
     frames = _extract_frames(raw, mime)
     if not frames:
-        verdict = {
+        # Not cached: an oversize/undecodable result shouldn't stick around.
+        return {
             "verdict": "block" if FAIL_MODE == "closed" else "allow",
             "category": "unscannable",
             "confidence": 0.0,
             "reason": "file type or size not scannable",
             "error": True,
         }
-        _cache_put(cache_key, verdict)
-        return verdict
 
     verdict = None
     for data, media_type in frames:
@@ -316,7 +314,10 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
         if verdict.get("verdict") == "block":
             break  # one bad frame is enough
 
-    _cache_put(cache_key, verdict)
+    # Never cache a transient failure (e.g. an API outage under FAIL_MODE=closed),
+    # or a brief outage would keep deleting that image for the rest of the session.
+    if not verdict.get("error"):
+        _cache_put(cache_key, verdict)
     return verdict
 
 
@@ -814,13 +815,6 @@ def _embed_image_urls(message: discord.Message) -> list[tuple[str, str]]:
     return out
 
 
-async def _embed_payloads(message: discord.Message) -> list[tuple[str, str, bytes]]:
-    payloads: list[tuple[str, str, bytes]] = []
-    for name, url in _embed_image_urls(message):
-        raw = await _fetch_image_bytes(url)
-        if raw and _looks_like_image(raw):
-            payloads.append((name, "image/png", raw))
-    return payloads
 
 
 @bot.event
@@ -853,10 +847,13 @@ async def on_message(message: discord.Message):
 
 
 async def _scan_created(message: discord.Message, cfg: dict):
+    acted = False
     payloads = await _sticker_attachment_payloads(message)
     if payloads:
-        await _run_moderation(message, payloads, cfg)
-    if message.embeds:  # some GIF-picker posts arrive with the embed already attached
+        acted = await _run_moderation(message, payloads, cfg)
+    # Skip embeds if the attachment/sticker pass already deleted the message —
+    # otherwise we'd restrict the author twice and open a second case.
+    if not acted and message.embeds:
         await _scan_embeds(message, cfg)
 
 
@@ -874,12 +871,20 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 async def _scan_embeds(message: discord.Message, cfg: dict):
     if message.id in embed_scanned:
         return
-    payloads = await _embed_payloads(message)
-    if not payloads:
+    # Extract URLs synchronously and mark BEFORE any await, so two edits arriving
+    # back-to-back can't both slip past the dedup check and double-process. If there
+    # are no image embeds yet, don't mark — a later edit may still add some.
+    urls = _embed_image_urls(message)
+    if not urls:
         return
     embed_scanned[message.id] = True
     while len(embed_scanned) > 1000:
         embed_scanned.popitem(last=False)
+    payloads: list[tuple[str, str, bytes]] = []
+    for name, url in urls:
+        raw = await _fetch_image_bytes(url)
+        if raw and _looks_like_image(raw):
+            payloads.append((name, "image/png", raw))
     await _run_moderation(message, payloads, cfg)
 
 
@@ -902,9 +907,10 @@ async def _run_moderation(
     message: discord.Message, payloads: list[tuple[str, str, bytes]], cfg: dict
 ):
     """Shared core: classify already-downloaded images (name, mime, raw) and act on
-    any that are flagged. Used for attachments, stickers, and embed/link images."""
+    any that are flagged. Returns True if the message was flagged (and deleted). Used
+    for attachments, stickers, and embed/link images."""
     if not payloads:
-        return
+        return False
     author = message.author
     channel = message.channel
     sensitivity = cfg.get("sensitivity", "standard")
@@ -945,9 +951,12 @@ async def _run_moderation(
         approved_posts = cfg.setdefault("approved_posts", {})
         for (_, _, raw), v in zip(payloads, results):
             if v.get("category") == "approved":
-                approved_posts.setdefault(
-                    hashlib.sha256(raw).hexdigest(), []
-                ).append([channel.id, message.id])
+                lst = approved_posts.setdefault(hashlib.sha256(raw).hexdigest(), [])
+                entry = [channel.id, message.id]
+                if entry not in lst:  # dedupe repeats of the same message
+                    lst.append(entry)
+                    if len(lst) > 50:  # bound the per-image history
+                        del lst[: len(lst) - 50]
         state.save()
 
     flagged = [
@@ -956,7 +965,7 @@ async def _run_moderation(
         if v["verdict"] == "block"
     ]
     if not flagged:
-        return  # clean: the message was never touched
+        return False  # clean: the message was never touched
 
     # A message is atomic — one bad item takes the whole message with it.
     try:
@@ -996,6 +1005,7 @@ async def _run_moderation(
         pass
 
     await open_case(message, flagged, worst, restricted, critical)
+    return True
 
 
 async def open_case(
