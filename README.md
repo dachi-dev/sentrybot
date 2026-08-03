@@ -87,10 +87,11 @@ Three buttons:
 
 - **Restore access** — lifts the restriction, nothing else.
 - **Uphold restriction** — keeps the restriction; closes the case.
-- **Approve (return to user)** — restores access and **DMs the image back to the author**
-  so they can repost it themselves, rather than the bot reposting on their behalf. Use
-  this when you'd rather the cleared image reappear as the user's own genuine post. If
-  the user has DMs closed, the case notes that it couldn't be delivered.
+- **Approve & repost** — restores access, **re-posts the cleared image** (un-spoilered)
+  to its origin channel credited to the author, and DMs the user. Crucially, it also
+  **adds the image's hash to a per-server allow-list**, so the repost — and any future
+  post of that exact image, by anyone — is never flagged again. Without this, a repost
+  would just be re-classified to the same verdict and removed in a loop.
 
 **Exception:** if Claude classifies something as sexual content involving a minor, the
 image is **not** re-uploaded to the review channel. The case carries metadata only, plus

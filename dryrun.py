@@ -2,6 +2,7 @@
 objects and a stubbed Claude, so the logic can be verified without a token."""
 
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -191,6 +192,25 @@ async def main():
     for _ in range(3):
         await sentry.classify(raw, "image/png", "standard")
     print(f"\n=== hash cache ===\n  3 identical images -> {len(CALLS)} api call(s)")
+
+    # approved allow-list: a whitelisted image is passed untouched, no API call
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    NEXT_VERDICT.update(payload=gore)  # would be blocked if it were classified
+    NEXT_VERDICT["raise"] = False
+    guild = FakeGuild()
+    cfg = sentry.state.guild(guild.id)
+    cfg["review_channel"] = 77
+    cfg["restricted_role"] = 999
+    att = FakeAttachment("approved.png", (10, 200, 10))
+    raw = await att.read()
+    cfg["approved_hashes"] = [hashlib.sha256(raw).hexdigest()]
+    msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "reposting approved image")
+    await sentry.process(msg, [att], cfg)
+    print("\n=== approved allow-list (image a mod approved) ===")
+    print(f"  api calls (want 0)        : {len(CALLS)}")
+    print(f"  message deleted (want No) : {msg.deleted}")
 
 
 asyncio.run(main())

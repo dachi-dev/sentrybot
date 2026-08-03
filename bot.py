@@ -108,6 +108,7 @@ class State:
                 "enabled": True,
                 "sensitivity": "standard",  # relaxed | standard | strict
                 "exempt_channels": [],
+                "approved_hashes": [],  # sha256s a mod approved; never re-flagged
             },
         )
 
@@ -438,15 +439,16 @@ class ReviewView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Approve (return to user)",
+        label="Approve & repost",
         style=discord.ButtonStyle.primary,
         custom_id="sentry:approve_return",
     )
-    async def approve_return(
+    async def approve_repost(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        """Restore access and DM the cleared image back to the author so they can
-        repost it themselves, rather than the bot reposting on their behalf."""
+        """Restore access and re-post the cleared image to its origin channel,
+        credited to the author. The original was deleted on flagging and Discord
+        has no un-delete, so a repost is the only way to put it back in-channel."""
         await interaction.response.defer()
         member = await _resolve_member(
             interaction.guild, _case_user_id(interaction.message)
@@ -458,39 +460,62 @@ class ReviewView(discord.ui.View):
         await unrestrict(member, f"approved by {interaction.user}")
 
         channel_id = _case_channel_id(interaction.message)
-        where = f"<#{channel_id}>" if channel_id else "the channel"
+        origin = interaction.guild.get_channel(channel_id) if channel_id else None
+        where = origin.mention if origin else "the channel"
 
-        # Hand the actual image bytes back to the user; the original was deleted,
-        # so without this they'd have nothing to repost.
+        # The image survives only as the spoilered copy on this case; re-upload it
+        # un-spoilered to the origin channel, tagged to the original author.
         files = []
+        hashes = []
         for att in interaction.message.attachments:
             name = att.filename
             if name.startswith("SPOILER_"):
                 name = name[len("SPOILER_") :]
             try:
-                files.append(discord.File(io.BytesIO(await att.read()), filename=name))
+                data = await att.read()
+                hashes.append(hashlib.sha256(data).hexdigest())
+                files.append(discord.File(io.BytesIO(data), filename=name))
             except Exception:
-                log.exception("could not read case attachment to return to user")
+                log.exception("could not read case attachment for repost")
 
-        body = (
-            f"Your image in **{interaction.guild.name}** was approved by a moderator. "
-            f"Your permissions are restored and the image is attached here — you can "
-            f"post it again yourself in {where}."
-        )
-        sent = False
+        # Whitelist these images so the repost — and any future post of them — is
+        # not flagged again.
+        cfg = state.guild(interaction.guild.id)
+        approved = cfg.setdefault("approved_hashes", [])
+        if any(h not in approved for h in hashes):
+            approved.extend(h for h in hashes if h not in approved)
+            state.save()
+
+        reposted = False
+        if origin is not None and files:
+            try:
+                await origin.send(
+                    content=f"{member.mention} — image approved by a moderator:",
+                    files=files,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, roles=False, users=False
+                    ),
+                )
+                reposted = True
+            except discord.Forbidden:
+                log.warning("cannot repost approved image to %s", origin)
+
         try:
-            if files:
-                await member.send(body, files=files)
-            else:
-                await member.send(body)
-            sent = True
+            await member.send(
+                f"A moderator in **{interaction.guild.name}** approved your image. Your "
+                f"permissions are restored and it's been re-posted in {where}."
+                if reposted
+                else f"A moderator in **{interaction.guild.name}** approved your image and "
+                f"restored your permissions, but it couldn't be re-posted automatically — "
+                f"you're welcome to post it again in {where}."
+            )
         except discord.Forbidden:
             pass
 
         note = f"Approved by {interaction.user.mention}; access restored and " + (
-            "image sent to the user to repost."
-            if sent
-            else "user has DMs closed — image could not be delivered."
+            f"image re-posted in {where}."
+            if reposted
+            else "repost failed — user notified they can repost."
         )
         await _close_case(interaction, note, discord.Colour.green(), deferred=True)
 
@@ -607,12 +632,22 @@ async def process(
     if not payloads:
         return
 
-    results = await asyncio.gather(
-        *(
-            classify(raw, att.content_type or "image/png", sensitivity)
-            for att, raw in payloads
-        )
-    )
+    # Images a moderator has explicitly approved are never re-flagged, no matter
+    # who reposts them. This also skips the API call (and its cost) for them.
+    approved = set(cfg.get("approved_hashes", []))
+
+    async def verdict_for(att: discord.Attachment, raw: bytes) -> dict:
+        if hashlib.sha256(raw).hexdigest() in approved:
+            return {
+                "verdict": "allow",
+                "category": "approved",
+                "confidence": 1.0,
+                "reason": "previously approved by a moderator",
+                "error": False,
+            }
+        return await classify(raw, att.content_type or "image/png", sensitivity)
+
+    results = await asyncio.gather(*(verdict_for(att, raw) for att, raw in payloads))
 
     flagged = [
         (att, raw, v) for (att, raw), v in zip(payloads, results) if v["verdict"] == "block"
