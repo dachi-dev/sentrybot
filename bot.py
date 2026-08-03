@@ -817,9 +817,44 @@ def _embed_image_urls(message: discord.Message) -> list[tuple[str, str]]:
 
 
 
+# Permissions Sentry needs to function; checked at runtime so an under-permissioned
+# install surfaces loudly instead of failing silently.
+REQUIRED_PERMS = {
+    "view_channel": "View Channel",
+    "send_messages": "Send Messages",
+    "manage_messages": "Manage Messages",
+    "manage_roles": "Manage Roles",
+    "attach_files": "Attach Files",
+    "embed_links": "Embed Links",
+    "read_message_history": "Read Message History",
+}
+
+
+def _missing_perms(guild: discord.Guild) -> list[str]:
+    """Required permissions the bot lacks at the guild level (Administrator covers all)."""
+    me = guild.me
+    if me is None:
+        return []
+    perms = me.guild_permissions
+    return [label for attr, label in REQUIRED_PERMS.items() if not getattr(perms, attr)]
+
+
 @bot.event
 async def on_ready():
     log.info("connected as %s (%d guilds)", bot.user, len(bot.guilds))
+    for guild in bot.guilds:
+        missing = _missing_perms(guild)
+        if missing:
+            log.warning("guild '%s' missing permissions: %s", guild.name, ", ".join(missing))
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    missing = _missing_perms(guild)
+    if missing:
+        log.warning("joined '%s' missing permissions: %s", guild.name, ", ".join(missing))
+    else:
+        log.info("joined '%s' with all required permissions", guild.name)
 
 
 def _guild_scans(message: discord.Message, cfg: dict) -> bool:
@@ -1231,6 +1266,14 @@ async def status_cmd(interaction: discord.Interaction):
         value=f"{len(cfg.get('approved_hashes', []))} approved · "
         f"{len(cfg.get('blocked_hashes', {}))} blocked",
         inline=True,
+    )
+    missing = _missing_perms(interaction.guild)
+    embed.add_field(
+        name="Permissions",
+        value="✅ all present"
+        if not missing
+        else "⚠️ **missing:** " + ", ".join(missing),
+        inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
