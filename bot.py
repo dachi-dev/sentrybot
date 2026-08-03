@@ -441,16 +441,15 @@ class ReviewView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Approve & repost",
+        label="Approve",
         style=discord.ButtonStyle.primary,
         custom_id="sentry:approve_return",
     )
-    async def approve_repost(
+    async def approve(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        """Restore access and re-post the cleared image to its origin channel,
-        credited to the author. The original was deleted on flagging and Discord
-        has no un-delete, so a repost is the only way to put it back in-channel."""
+        """Restore access, allow-list the image so a repost isn't flagged, and DM the
+        user that they may repost it themselves. The bot never reposts for the user."""
         await interaction.response.defer()
         member = await _resolve_member(
             interaction.guild, _case_user_id(interaction.message)
@@ -462,26 +461,18 @@ class ReviewView(discord.ui.View):
         await unrestrict(member, f"approved by {interaction.user}")
 
         channel_id = _case_channel_id(interaction.message)
-        origin = interaction.guild.get_channel(channel_id) if channel_id else None
-        where = origin.mention if origin else "the channel"
+        where = f"<#{channel_id}>" if channel_id else "the channel"
 
-        # The image survives only as the spoilered copy on this case; re-upload it
-        # un-spoilered to the origin channel, tagged to the original author.
-        files = []
-        hashes = []
-        for att in interaction.message.attachments:
-            name = att.filename
-            if name.startswith("SPOILER_"):
-                name = name[len("SPOILER_") :]
-            try:
-                data = await att.read()
-                hashes.append(hashlib.sha256(data).hexdigest())
-                files.append(discord.File(io.BytesIO(data), filename=name))
-            except Exception:
-                log.exception("could not read case attachment for repost")
-
-        # Whitelist these images so the repost — and any future post of them — is
-        # not flagged again, and drop them from the disapproved cache.
+        # Allow-list the image(s) so the user's own repost isn't flagged again, and
+        # drop them from the disapproved cache. Identify them by the stored fingerprint
+        # so the bot never has to re-read the image bytes.
+        hashes = _case_hashes(interaction.message)
+        if not hashes:  # fallback for older cases with no stored fingerprint
+            for att in interaction.message.attachments:
+                try:
+                    hashes.append(hashlib.sha256(await att.read()).hexdigest())
+                except Exception:
+                    log.exception("could not read case attachment to approve")
         cfg = state.guild(interaction.guild.id)
         approved = cfg.setdefault("approved_hashes", [])
         blocked = cfg.setdefault("blocked_hashes", {})
@@ -496,36 +487,17 @@ class ReviewView(discord.ui.View):
         if changed:
             state.save()
 
-        reposted = False
-        if origin is not None and files:
-            try:
-                await origin.send(
-                    content=f"{member.mention} — image approved by a moderator:",
-                    files=files,
-                    allowed_mentions=discord.AllowedMentions(
-                        everyone=False, roles=False, users=False
-                    ),
-                )
-                reposted = True
-            except discord.Forbidden:
-                log.warning("cannot repost approved image to %s", origin)
-
         try:
             await member.send(
-                f"A moderator in **{interaction.guild.name}** approved your image. Your "
-                f"permissions are restored and it's been re-posted in {where}."
-                if reposted
-                else f"A moderator in **{interaction.guild.name}** approved your image and "
-                f"restored your permissions, but it couldn't be re-posted automatically — "
-                f"you're welcome to post it again in {where}."
+                f"Good news — a moderator in **{interaction.guild.name}** approved your "
+                f"image. You're welcome to post it again in {where}; it won't be flagged."
             )
         except discord.Forbidden:
             pass
 
-        note = f"Approved by {interaction.user.mention}; access restored and " + (
-            f"image re-posted in {where}."
-            if reposted
-            else "repost failed — user notified they can repost."
+        note = (
+            f"Approved by {interaction.user.mention}; access restored, image allow-listed, "
+            f"and the user was told they may repost."
         )
         # Close the case: drop the image from the mod channel, keep the record, and
         # leave a single "Undo approval" control that works off the stored fingerprint.

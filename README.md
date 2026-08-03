@@ -93,12 +93,12 @@ Three buttons:
 
 - **Restore access** — lifts the restriction, nothing else.
 - **Uphold restriction** — keeps the restriction; closes the case.
-- **Approve & repost** — restores access, **re-posts the cleared image** (un-spoilered)
-  to its origin channel credited to the author, and DMs the user. It also **adds the
-  image's hash to a per-server allow-list**, so the repost — and any future post of that
-  exact image, by anyone — is never flagged again. (Without this, a repost would just be
-  re-classified to the same verdict and removed in a loop.) The closed case keeps a single
-  **Undo approval** button.
+- **Approve** — restores access, **adds the image's hash to a per-server allow-list**, and
+  **DMs the user** that they may repost it themselves. The bot never reposts on the user's
+  behalf; because the image is allow-listed, the user's own repost — and any future post of
+  that exact image, by anyone — is not flagged again. (Without the allow-list, a repost
+  would just be re-classified to the same verdict and removed in a loop.) The closed case
+  keeps a single **Undo approval** button.
 - **Undo approval** (shown only after Approve) — removes the image from the allow-list via
   the stored fingerprint, so it can be scanned again. No one has to re-handle the image.
 
@@ -114,8 +114,9 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   a lot of fighting-game or medical content. The broader categories (hate symbols, drugs,
   scam/spam, etc.) widen the false-positive surface — hate-symbol detection in particular
   has to tell WWII history, the Hindu/Buddhist swastika, and anti-hate imagery apart from
-  the real thing — so when a clean image does get caught, the **Approve & repost** review
-  button restores it, re-posts it, and allow-lists it, keeping the cost of a mistake low.
+  the real thing — so when a clean image does get caught, the **Approve** review button
+  restores access, allow-lists the image, and tells the user they can repost it, keeping
+  the cost of a mistake low.
 - **`SENTRY_FAIL_MODE=closed`** (default) deletes when the API errors. On a provider
   outage that means every image in the server gets deleted — `open` is the safer default
   for large servers, since a missed image is usually cheaper than mass false deletions.
