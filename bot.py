@@ -206,43 +206,44 @@ def _cache_put(key: str, value: dict) -> None:
         verdict_cache.popitem(last=False)
 
 
-def prepare_image(raw: bytes, mime: str) -> tuple[str, str] | None:
-    """Downscale to MAX_EDGE and return (base64_data, media_type)."""
+GIF_SAMPLE_FRAMES = max(1, int(os.getenv("SENTRY_GIF_FRAMES", "4")))
+
+
+def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
+    """Return up to GIF_SAMPLE_FRAMES (base64_jpeg, media_type) sampled evenly across
+    an image. Static images yield one frame; animated GIF/WebP/APNG yield several so a
+    bad frame later in the loop isn't missed. Empty list if it can't be decoded."""
     if HAS_PIL:
         try:
             with Image.open(io.BytesIO(raw)) as img:
-                img.seek(0)  # animated formats: classify the first frame
-                img = img.convert("RGB")
-                img.thumbnail((MAX_EDGE, MAX_EDGE), Image.LANCZOS)
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=80, optimize=True)
-                return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
+                n = getattr(img, "n_frames", 1)
+                if n <= 1:
+                    indices = [0]
+                else:
+                    k = min(GIF_SAMPLE_FRAMES, n)
+                    indices = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+                out = []
+                for idx in indices:
+                    img.seek(idx)
+                    frame = img.convert("RGB")
+                    frame.thumbnail((MAX_EDGE, MAX_EDGE), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    frame.save(buf, format="JPEG", quality=80, optimize=True)
+                    out.append(
+                        (base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg")
+                    )
+                return out
         except Exception:
-            log.warning("pillow failed to decode image, falling back to raw bytes")
+            log.warning("pillow failed to decode image")
 
-    if mime not in SUPPORTED_MIME or len(raw) > API_IMAGE_BYTE_LIMIT * 0.7:
-        return None
-    return base64.standard_b64encode(raw).decode(), mime
+    # No Pillow: fall back to the raw bytes as a single frame if the type is supported.
+    if mime in SUPPORTED_MIME and len(raw) <= API_IMAGE_BYTE_LIMIT * 0.7:
+        return [(base64.standard_b64encode(raw).decode(), mime)]
+    return []
 
 
-async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
-    """Return a verdict dict. Never raises."""
-    digest = hashlib.sha256(raw).hexdigest()
-    cache_key = f"{digest}:{sensitivity}"
-    if cached := _cache_get(cache_key):
-        return cached
-
-    prepared = prepare_image(raw, mime)
-    if prepared is None:
-        return {
-            "verdict": "block" if FAIL_MODE == "closed" else "allow",
-            "category": "unscannable",
-            "confidence": 0.0,
-            "reason": "file type or size not scannable",
-            "error": True,
-        }
-
-    data, media_type = prepared
+async def _classify_one(data: str, media_type: str, sensitivity: str) -> dict:
+    """One Claude vision call on one prepared frame. Never raises."""
     try:
         async with check_semaphore:
             resp = await claude.messages.create(
@@ -277,15 +278,43 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
         verdict.setdefault("confidence", 0.0)
         verdict.setdefault("reason", "")
         verdict["error"] = False
+        return verdict
     except Exception:
         log.exception("classification failed")
-        verdict = {
+        return {
             "verdict": "block" if FAIL_MODE == "closed" else "allow",
             "category": "check_failed",
             "confidence": 0.0,
             "reason": "moderation check errored",
             "error": True,
         }
+
+
+async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
+    """Return a verdict dict for an image. Never raises. For an animation, frames are
+    checked in order and the first blocked frame condemns the whole thing."""
+    digest = hashlib.sha256(raw).hexdigest()
+    cache_key = f"{digest}:{sensitivity}"
+    if cached := _cache_get(cache_key):
+        return cached
+
+    frames = _extract_frames(raw, mime)
+    if not frames:
+        verdict = {
+            "verdict": "block" if FAIL_MODE == "closed" else "allow",
+            "category": "unscannable",
+            "confidence": 0.0,
+            "reason": "file type or size not scannable",
+            "error": True,
+        }
+        _cache_put(cache_key, verdict)
+        return verdict
+
+    verdict = None
+    for data, media_type in frames:
+        verdict = await _classify_one(data, media_type, sensitivity)
+        if verdict.get("verdict") == "block":
+            break  # one bad frame is enough
 
     _cache_put(cache_key, verdict)
     return verdict
@@ -714,56 +743,178 @@ def image_attachments(message: discord.Message) -> list[discord.Attachment]:
     ]
 
 
+# Message ids whose embeds we've already scanned — embeds can arrive on create and
+# then again via edits, so dedupe to avoid re-scanning.
+embed_scanned: "OrderedDict[int, bool]" = OrderedDict()
+
+
+async def _fetch_image_bytes(url: str) -> bytes | None:
+    """Download an image URL (embed or sticker), size-capped. None on any problem or
+    if the content isn't an image (e.g. a Tenor mp4)."""
+    session = bot.http_session
+    if session is None or not url:
+        return None
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return None
+            ctype = resp.headers.get("Content-Type", "")
+            if ctype and not ctype.startswith("image/"):
+                return None
+            data = await resp.content.read(API_IMAGE_BYTE_LIMIT + 1)
+            if not data or len(data) > API_IMAGE_BYTE_LIMIT:
+                return None
+            return data
+    except Exception:
+        return None
+
+
+def _looks_like_image(raw: bytes) -> bool:
+    """Guard so we never run moderation (and fail-closed) on a non-image embed."""
+    if not HAS_PIL:
+        return True
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
+async def _sticker_attachment_payloads(
+    message: discord.Message,
+) -> list[tuple[str, str, bytes]]:
+    """(name, mime, raw) for image attachments and stickers present at post time."""
+    payloads: list[tuple[str, str, bytes]] = []
+    for att in image_attachments(message):
+        try:
+            payloads.append(
+                (att.filename, att.content_type or "image/png", await att.read())
+            )
+        except Exception:
+            log.exception("failed to download attachment")
+    for st in message.stickers:
+        if getattr(st.format, "name", "").lower() == "lottie":
+            continue  # vector JSON, not a raster image
+        raw = await _fetch_image_bytes(st.url)
+        if raw and _looks_like_image(raw):
+            payloads.append((f"sticker_{st.name}.img", "image/png", raw))
+    return payloads
+
+
+def _embed_image_urls(message: discord.Message) -> list[tuple[str, str]]:
+    """(name, url) for images referenced by embeds: direct image links, Tenor/Giphy
+    GIFs, and any rich embed's main image. Skips article/website/YouTube previews."""
+    out: list[tuple[str, str]] = []
+    for i, e in enumerate(message.embeds):
+        if e.image and e.image.url:
+            out.append((f"embed{i}_image.img", e.image.proxy_url or e.image.url))
+        if e.type in ("image", "gifv") and e.thumbnail and e.thumbnail.url:
+            out.append((f"embed{i}_thumb.img", e.thumbnail.proxy_url or e.thumbnail.url))
+    return out
+
+
+async def _embed_payloads(message: discord.Message) -> list[tuple[str, str, bytes]]:
+    payloads: list[tuple[str, str, bytes]] = []
+    for name, url in _embed_image_urls(message):
+        raw = await _fetch_image_bytes(url)
+        if raw and _looks_like_image(raw):
+            payloads.append((name, "image/png", raw))
+    return payloads
+
+
 @bot.event
 async def on_ready():
     log.info("connected as %s (%d guilds)", bot.user, len(bot.guilds))
 
 
+def _guild_scans(message: discord.Message, cfg: dict) -> bool:
+    """Shared gate: is this a message in a scanned channel of an enabled guild?"""
+    if message.author.bot or message.guild is None:
+        return False
+    if not cfg["enabled"] or message.channel.id in cfg["exempt_channels"]:
+        return False
+    if message.channel.id == cfg.get("review_channel"):
+        return False
+    return True
+
+
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
         return
-
     cfg = state.guild(message.guild.id)
-    if not cfg["enabled"] or message.channel.id in cfg["exempt_channels"]:
+    if not _guild_scans(message, cfg):
         return
-    if message.channel.id == cfg.get("review_channel"):
-        return
+    # Attachments and stickers are here now; link/GIF embeds usually arrive a moment
+    # later via a message edit (handled in on_message_edit).
+    if message.attachments or message.stickers or message.embeds:
+        asyncio.create_task(_scan_created(message, cfg))
 
-    attachments = image_attachments(message)
-    if not attachments:
-        return
 
-    # The message stays up while we check. Off to a task so the gateway
-    # keeps flowing during the API round trip.
-    asyncio.create_task(process(message, attachments, cfg))
+async def _scan_created(message: discord.Message, cfg: dict):
+    payloads = await _sticker_attachment_payloads(message)
+    if payloads:
+        await _run_moderation(message, payloads, cfg)
+    if message.embeds:  # some GIF-picker posts arrive with the embed already attached
+        await _scan_embeds(message, cfg)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # Discord adds link/GIF embeds by editing the message shortly after it's posted.
+    if after.guild is None or not after.embeds:
+        return
+    cfg = state.guild(after.guild.id)
+    if not _guild_scans(after, cfg):
+        return
+    await _scan_embeds(after, cfg)
+
+
+async def _scan_embeds(message: discord.Message, cfg: dict):
+    if message.id in embed_scanned:
+        return
+    payloads = await _embed_payloads(message)
+    if not payloads:
+        return
+    embed_scanned[message.id] = True
+    while len(embed_scanned) > 1000:
+        embed_scanned.popitem(last=False)
+    await _run_moderation(message, payloads, cfg)
 
 
 async def process(
     message: discord.Message, attachments: list[discord.Attachment], cfg: dict
 ):
+    """Entry point for uploaded image attachments."""
+    payloads: list[tuple[str, str, bytes]] = []
+    for att in attachments:
+        try:
+            payloads.append(
+                (att.filename, att.content_type or "image/png", await att.read())
+            )
+        except Exception:
+            log.exception("failed to download attachment")
+    await _run_moderation(message, payloads, cfg)
+
+
+async def _run_moderation(
+    message: discord.Message, payloads: list[tuple[str, str, bytes]], cfg: dict
+):
+    """Shared core: classify already-downloaded images (name, mime, raw) and act on
+    any that are flagged. Used for attachments, stickers, and embed/link images."""
+    if not payloads:
+        return
     author = message.author
     channel = message.channel
     sensitivity = cfg.get("sensitivity", "standard")
-
-    payloads = []
-    for att in attachments:
-        try:
-            raw = await att.read()
-        except Exception:
-            log.exception("failed to download attachment")
-            continue
-        payloads.append((att, raw))
-
-    if not payloads:
-        return
 
     # A moderator's decisions are remembered so reposts never hit Claude again:
     # approved images pass untouched; disapproved ones re-block straight from cache.
     approved = set(cfg.get("approved_hashes", []))
     blocked = cfg.get("blocked_hashes", {})
 
-    async def verdict_for(att: discord.Attachment, raw: bytes) -> dict:
+    async def verdict_for(mime: str, raw: bytes) -> dict:
         digest = hashlib.sha256(raw).hexdigest()
         if digest in approved:
             return {
@@ -782,15 +933,17 @@ async def process(
                 "reason": v.get("reason", "previously flagged"),
                 "error": False,
             }
-        return await classify(raw, att.content_type or "image/png", sensitivity)
+        return await classify(raw, mime, sensitivity)
 
-    results = await asyncio.gather(*(verdict_for(att, raw) for att, raw in payloads))
+    results = await asyncio.gather(
+        *(verdict_for(mime, raw) for _, mime, raw in payloads)
+    )
 
     # Remember where an allow-listed image is (re)posted, so undoing its approval
     # can delete exactly those messages later — no history-scanning guesswork.
     if any(v.get("category") == "approved" for v in results):
         approved_posts = cfg.setdefault("approved_posts", {})
-        for (att, raw), v in zip(payloads, results):
+        for (_, _, raw), v in zip(payloads, results):
             if v.get("category") == "approved":
                 approved_posts.setdefault(
                     hashlib.sha256(raw).hexdigest(), []
@@ -798,12 +951,14 @@ async def process(
         state.save()
 
     flagged = [
-        (att, raw, v) for (att, raw), v in zip(payloads, results) if v["verdict"] == "block"
+        (name, raw, v)
+        for (name, _, raw), v in zip(payloads, results)
+        if v["verdict"] == "block"
     ]
     if not flagged:
         return  # clean: the message was never touched
 
-    # A message is atomic — one bad attachment takes the whole message with it.
+    # A message is atomic — one bad item takes the whole message with it.
     try:
         await message.delete()
     except discord.Forbidden:
@@ -887,7 +1042,7 @@ async def open_case(
     # again — it short-circuits to this block in process().
     blocked = cfg.setdefault("blocked_hashes", {})
     changed = False
-    for att, raw, v in flagged:
+    for name, raw, v in flagged:
         if v.get("error") or v.get("category") in (None, "check_failed", "unscannable"):
             continue
         digest = hashlib.sha256(raw).hexdigest()
@@ -922,10 +1077,8 @@ async def open_case(
         embed.set_footer(
             text="Attachments are spoilered and removed once the case is resolved."
         )
-        for att, raw, _ in flagged[:5]:
-            files.append(
-                discord.File(io.BytesIO(raw), filename=f"SPOILER_{att.filename}")
-            )
+        for name, raw, _ in flagged[:5]:
+            files.append(discord.File(io.BytesIO(raw), filename=f"SPOILER_{name}"))
 
     try:
         await review.send(
@@ -1118,7 +1271,7 @@ async def post_cmd(
         fake.content = text or ""
         await open_case(
             fake,
-            [(image, raw, verdict)],
+            [(image.filename, raw, verdict)],
             verdict,
             restricted,
             verdict.get("category") == "minor_sexual",

@@ -45,9 +45,16 @@ All `/sentry` commands require Manage Server. Review buttons require Manage Mess
 
 ## How detection works
 
-1. `on_message` sees attachments and hands off to a background task — the gateway
-   keeps flowing, the message stays up.
-2. Bytes are downscaled to 768px and sent to Claude Haiku.
+1. A message's images are collected and handed to a background task — the gateway
+   keeps flowing, the message stays up. Covered sources:
+   - **Uploaded image files** (`on_message`).
+   - **Stickers** (non-Lottie), fetched and scanned (`on_message`).
+   - **Direct image links, and Tenor/Giphy GIFs** — Discord attaches these as *embeds*
+     a moment after posting, so they're caught on `on_message_edit`. Article/website/
+     YouTube link previews are intentionally skipped.
+2. Each image is downscaled to 768px and sent to Claude Haiku. **Animated GIF/WebP are
+   sampled across up to `SENTRY_GIF_FRAMES` (default 4) frames** — a clip that's clean on
+   frame one but not later doesn't slip through; the first blocked frame condemns it.
 3. Clean → nothing happens at all. No edit, no repost, no trace.
 4. Flagged → message deleted, author restricted, case opened, author DM'd.
 
@@ -133,7 +140,11 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   even across restarts. Rates: <https://claude.com/pricing>
 - **Lower `SENTRY_MAX_EDGE` to 512** to roughly halve tokens and shave latency; obvious
   cases hold up well, borderline cases degrade.
-- **Videos are not scanned.** Claude vision takes images only.
+- **Videos are not scanned.** Claude vision takes images only — this includes the mp4
+  behind a Tenor/Giphy GIF, though its GIF preview frames *are* scanned. Multi-frame GIF
+  scanning multiplies the per-GIF cost by up to `SENTRY_GIF_FRAMES`; lower it to trade
+  coverage for cost. Embed/link scanning depends on the bot reaching the image URL and
+  fails open (an unreachable link is not flagged).
 - Every member is scanned, including moderators and admins. Note that the
   `Media Restricted` role cannot actually constrain a user with Administrator or
   the server owner — Discord permissions override channel overwrites for them — so
