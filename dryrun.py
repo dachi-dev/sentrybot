@@ -110,6 +110,7 @@ class FakeMessage:
         self.attachments, self.content = attachments, content
         self.deleted = False
         self.id = 555
+        self.jump_url = "http://discord/jump/555"
 
     async def delete(self):
         self.deleted = True
@@ -185,8 +186,8 @@ async def main():
     )
     await scenario("critical category", csam, [FakeAttachment("x.png", (30, 30, 30))])
     await scenario(
-        "API outage → fail-open (no action)", clean, [FakeAttachment("y.png", (80, 80, 80))],
-        raise_error=True,
+        "API outage → no action + mod-channel notice", clean,
+        [FakeAttachment("y.png", (80, 80, 80))], raise_error=True,
     )
 
     # cache: same bytes twice should cost one call

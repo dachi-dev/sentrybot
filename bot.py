@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import anthropic
 import discord
 from anthropic import AsyncAnthropic
 from discord import app_commands
@@ -250,7 +251,10 @@ def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
                     )
                 return out
         except Exception:
-            log.warning("pillow failed to decode image")
+            log.warning(
+                "pillow failed to decode image; falling back to a single-frame scan",
+                exc_info=True,
+            )
 
     # PIL absent or it failed on this image: send the raw bytes as one frame, labeled
     # by their ACTUAL sniffed format so a wrong media_type can't 400 the API.
@@ -260,52 +264,73 @@ def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
     return []
 
 
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
+
+
 async def _classify_one(data: str, media_type: str, sensitivity: str) -> dict:
-    """One Claude vision call on one prepared frame. Never raises."""
-    try:
-        async with check_semaphore:
-            resp = await claude.messages.create(
-                model=MODEL,
-                max_tokens=150,
-                system=SYSTEM_PROMPT.format(sensitivity=sensitivity),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": data,
+    """One Claude vision call on one prepared frame, retrying transient failures with
+    backoff. Never raises; fails open (verdict=allow, error=True) once it gives up."""
+    for attempt in range(3):
+        try:
+            async with check_semaphore:
+                resp = await claude.messages.create(
+                    model=MODEL,
+                    max_tokens=150,
+                    system=SYSTEM_PROMPT.format(sensitivity=sensitivity),
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data,
+                                    },
                                 },
-                            },
-                            {"type": "text", "text": "Classify this image."},
-                        ],
-                    },
-                    # Prefill forces bare JSON, no preamble.
-                    {"role": "assistant", "content": "{"},
-                ],
+                                {"type": "text", "text": "Classify this image."},
+                            ],
+                        },
+                        # Prefill forces bare JSON, no preamble.
+                        {"role": "assistant", "content": "{"},
+                    ],
+                )
+            text = "{" + "".join(
+                b.text for b in resp.content if getattr(b, "type", "") == "text"
             )
-        text = "{" + "".join(
-            b.text for b in resp.content if getattr(b, "type", "") == "text"
-        )
-        verdict = json.loads(text[: text.rindex("}") + 1])
-        verdict.setdefault("verdict", "block")
-        verdict.setdefault("category", "unknown")
-        verdict.setdefault("confidence", 0.0)
-        verdict.setdefault("reason", "")
-        verdict["error"] = False
-        return verdict
-    except Exception:
-        log.exception("classification failed")
-        return {
-            "verdict": "allow",  # fail open: a failed check never takes action
-            "category": "check_failed",
-            "confidence": 0.0,
-            "reason": "moderation check errored",
-            "error": True,
-        }
+            verdict = json.loads(text[: text.rindex("}") + 1])
+            verdict.setdefault("verdict", "block")
+            verdict.setdefault("category", "unknown")
+            verdict.setdefault("reason", "")
+            # Claude occasionally quotes the number; coerce so downstream compares/formats
+            # can't blow up on a str.
+            try:
+                verdict["confidence"] = float(verdict.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                verdict["confidence"] = 0.0
+            verdict["error"] = False
+            return verdict
+        except anthropic.APIConnectionError:  # network errors and timeouts
+            retryable = True
+        except anthropic.APIStatusError as e:
+            retryable = e.status_code in _RETRYABLE_STATUS
+            if not retryable:
+                log.warning("classification rejected (%s): %s", e.status_code, e)
+        except Exception:
+            log.exception("classification failed")
+            retryable = False
+        if not retryable or attempt == 2:
+            break
+        await asyncio.sleep(2**attempt)  # 1s, 2s
+
+    return {
+        "verdict": "allow",  # fail open: a failed check never takes action
+        "category": "check_failed",
+        "confidence": 0.0,
+        "reason": "moderation check errored",
+        "error": True,
+    }
 
 
 async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
@@ -942,6 +967,49 @@ async def _scan_embeds(message: discord.Message, cfg: dict):
     await _run_moderation(message, payloads, cfg)
 
 
+def _should_quarantine(verdict: dict, min_conf: float) -> bool:
+    """Whether a verdict warrants removing the image: a failed check never acts,
+    suspected CSAM always acts, otherwise the confidence must clear the threshold."""
+    if verdict.get("verdict") != "block" or verdict.get("error"):
+        return False
+    if verdict.get("category") == "minor_sexual":
+        return True
+    try:
+        confidence = float(verdict.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return confidence >= min_conf
+
+
+async def _log_check_failure(message: discord.Message, errored: list, cfg: dict):
+    """Post a notice to the review channel that a check could not complete. No action
+    is taken — the image is left up for a moderator to review by hand."""
+    review_id = cfg.get("review_channel")
+    review = message.guild.get_channel(review_id) if review_id else None
+    if review is None:
+        return
+    reasons = ", ".join(sorted({v.get("category", "error") for _, _, v in errored}))
+    embed = discord.Embed(
+        title="Check failed — no action taken",
+        colour=discord.Colour.dark_gold(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)")
+    embed.add_field(
+        name="Channel", value=f"{message.channel.mention} (`{message.channel.id}`)"
+    )
+    embed.add_field(name="Images", value=str(len(errored)), inline=True)
+    embed.add_field(name="Why", value=reasons or "error", inline=True)
+    jump = getattr(message, "jump_url", None)
+    if jump:
+        embed.add_field(name="Message", value=f"[jump to it]({jump})", inline=False)
+    embed.set_footer(text="The image was left up. Review it manually.")
+    try:
+        await review.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        log.warning("cannot post check-failure notice to review channel")
+
+
 async def process(
     message: discord.Message, attachments: list[discord.Attachment], cfg: dict
 ):
@@ -1013,21 +1081,24 @@ async def _run_moderation(
                         del lst[: len(lst) - 50]
         state.save()
 
-    # Quarantine a block only if it's confident enough — a failed check never acts,
-    # and suspected CSAM always acts regardless of the threshold.
+    # Quarantine a block only if it's confident enough (a failed check never acts,
+    # suspected CSAM always does — see _should_quarantine).
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
-
-    def _quarantine(v: dict) -> bool:
-        if v["verdict"] != "block" or v.get("error"):
-            return False
-        if v.get("category") == "minor_sexual":
-            return True
-        return v.get("confidence", 0) >= min_conf
-
     flagged = [
-        (name, raw, v) for (name, _, raw), v in zip(payloads, results) if _quarantine(v)
+        (name, raw, v)
+        for (name, _, raw), v in zip(payloads, results)
+        if _should_quarantine(v, min_conf)
     ]
     if not flagged:
+        # Nothing to remove. If a check failed outright, surface it to moderators so
+        # the unscanned image can be reviewed by hand — but take no action on it.
+        errored = [
+            (name, raw, v)
+            for (name, _, raw), v in zip(payloads, results)
+            if v.get("error")
+        ]
+        if errored:
+            await _log_check_failure(message, errored, cfg)
         return False  # clean, below the confidence threshold, or a failed check
 
     # A message is atomic — one bad item takes the whole message with it.
@@ -1320,7 +1391,8 @@ async def status_cmd(interaction: discord.Interaction):
     )
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
     level_name = next(
-        (k for k, v in CONFIDENCE_LEVELS.items() if v == min_conf), f"{min_conf:.2f}"
+        (k for k, v in CONFIDENCE_LEVELS.items() if abs(v - min_conf) < 1e-9),
+        f"{min_conf:.2f}",
     )
     embed.add_field(
         name="Quarantine threshold", value=f"{level_name} (≥ {min_conf:.2f})", inline=True
@@ -1370,15 +1442,7 @@ async def post_cmd(
     )
 
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
-    should_block = (
-        verdict["verdict"] == "block"
-        and not verdict.get("error")
-        and (
-            verdict.get("category") == "minor_sexual"
-            or verdict.get("confidence", 0) >= min_conf
-        )
-    )
-    if should_block:
+    if _should_quarantine(verdict, min_conf):
         restricted = await restrict(
             interaction.user, f"flagged via /post: {verdict.get('category')}"
         )

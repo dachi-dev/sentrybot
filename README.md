@@ -131,8 +131,11 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   the real thing — so when a clean image does get caught, the **Approve** review button
   restores access, allow-lists the image, and tells the user they can repost it, keeping
   the cost of a mistake low.
-- **Failures never take action.** If the check can't complete (API outage, undecodable
-  or oversize file), the message is left up — an outage can't mass-delete content.
+- **Failures never take action, but are surfaced.** If the check can't complete (API
+  outage, undecodable or oversize file), the message is **left up** — an outage can't
+  mass-delete content — and a "Check failed — no action taken" notice is posted to the
+  review channel with a jump link so a moderator can review it by hand. Transient API
+  errors (429/5xx/timeouts) are retried with backoff before giving up.
 - **Confidence threshold** (`/sentry threshold`) sets how sure Claude must be before an
   image is quarantined: `low` (≥0.60), `medium` (≥0.75, default), `high` (≥0.90). Raise it
   if you see false positives; lower it to catch more borderline cases. Suspected CSAM is
