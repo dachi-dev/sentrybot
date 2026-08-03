@@ -78,20 +78,29 @@ with `/sentry unrestrict`.
 
 ## Review cases
 
-Each case embeds the user, origin channel, category, confidence, and a non-graphic
-reason. The flagged images are attached with `SPOILER_` filenames so they stay blurred
-until a moderator clicks — this is the only surviving copy once the original is deleted,
-so the review channel should be mod-only.
+Each case embeds the user, origin channel, category, confidence, a non-graphic reason,
+and the image's SHA-256 **fingerprint**. Flagged images are attached with `SPOILER_`
+filenames so they stay blurred until a moderator clicks, so the review channel should be
+mod-only.
+
+**Images are not hoarded.** The moment a case is resolved (any button), the bot **strips
+the image attachment** from the case, leaving a text-only audit record. Upheld harmful
+content is removed from the channel immediately rather than sitting there indefinitely —
+which matters, because a server that stockpiles such content risks being actioned by
+Discord. The stored fingerprint is what lets later actions work without the image.
 
 Three buttons:
 
 - **Restore access** — lifts the restriction, nothing else.
 - **Uphold restriction** — keeps the restriction; closes the case.
 - **Approve & repost** — restores access, **re-posts the cleared image** (un-spoilered)
-  to its origin channel credited to the author, and DMs the user. Crucially, it also
-  **adds the image's hash to a per-server allow-list**, so the repost — and any future
-  post of that exact image, by anyone — is never flagged again. Without this, a repost
-  would just be re-classified to the same verdict and removed in a loop.
+  to its origin channel credited to the author, and DMs the user. It also **adds the
+  image's hash to a per-server allow-list**, so the repost — and any future post of that
+  exact image, by anyone — is never flagged again. (Without this, a repost would just be
+  re-classified to the same verdict and removed in a loop.) The closed case keeps a single
+  **Undo approval** button.
+- **Undo approval** (shown only after Approve) — removes the image from the allow-list via
+  the stored fingerprint, so it can be scanned again. No one has to re-handle the image.
 
 **Exception:** if Claude classifies something as sexual content involving a minor, the
 image is **not** re-uploaded to the review channel. The case carries metadata only, plus
@@ -105,14 +114,16 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   a lot of fighting-game or medical content. The broader categories (hate symbols, drugs,
   scam/spam, etc.) widen the false-positive surface — hate-symbol detection in particular
   has to tell WWII history, the Hindu/Buddhist swastika, and anti-hate imagery apart from
-  the real thing — so when a clean image does get caught, the **False positive** review
-  button restores it *and* re-posts it, keeping the cost of a mistake low.
+  the real thing — so when a clean image does get caught, the **Approve & repost** review
+  button restores it, re-posts it, and allow-lists it, keeping the cost of a mistake low.
 - **`SENTRY_FAIL_MODE=closed`** (default) deletes when the API errors. On a provider
   outage that means every image in the server gets deleted — `open` is the safer default
   for large servers, since a missed image is usually cheaper than mass false deletions.
 - **Cost:** one Haiku call per image at ~800 input tokens, ~50 output. Identical
-  re-uploads hit an in-memory hash cache and cost nothing. Rates:
-  <https://claude.com/pricing>
+  re-uploads cost nothing: an in-memory cache covers the current session, and moderator
+  decisions (both approvals and disapprovals) **persist to `sentry_state.json`**, so a
+  reposted image that was already approved or already rejected never calls Claude again,
+  even across restarts. Rates: <https://claude.com/pricing>
 - **Lower `SENTRY_MAX_EDGE` to 512** to roughly halve tokens and shave latency; obvious
   cases hold up well, borderline cases degrade.
 - **Videos are not scanned.** Claude vision takes images only.

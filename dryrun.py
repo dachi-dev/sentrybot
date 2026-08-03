@@ -11,6 +11,11 @@ from types import SimpleNamespace
 os.environ.setdefault("DISCORD_TOKEN", "fake")
 os.environ.setdefault("ANTHROPIC_API_KEY", "fake")
 os.environ["SENTRY_STATE"] = "/tmp/dryrun_state.json"
+# Start each run from a clean slate so the persisted approve/block caches don't
+# leak between runs and make the scenarios non-deterministic.
+from pathlib import Path as _Path
+
+_Path("/tmp/dryrun_state.json").unlink(missing_ok=True)
 
 import discord
 from PIL import Image
@@ -125,6 +130,8 @@ async def scenario(label, verdict, attachments, *, raise_error=False):
     cfg = sentry.state.guild(guild.id)
     cfg["review_channel"] = 77
     cfg["restricted_role"] = 999
+    cfg["approved_hashes"] = []  # isolate scenarios from the persistent caches
+    cfg["blocked_hashes"] = {}
 
     msg = FakeMessage(guild, FakeChannel(10, "general"), attachments, "look at this")
     await sentry.process(msg, attachments, cfg)
@@ -211,6 +218,32 @@ async def main():
     print("\n=== approved allow-list (image a mod approved) ===")
     print(f"  api calls (want 0)        : {len(CALLS)}")
     print(f"  message deleted (want No) : {msg.deleted}")
+
+    # disapproved cache: a previously-blocked image is re-blocked WITHOUT Claude
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    NEXT_VERDICT.update(payload=clean)  # Claude would say clean — but cache says block
+    NEXT_VERDICT["raise"] = False
+    guild = FakeGuild()
+    cfg = sentry.state.guild(guild.id)
+    cfg["review_channel"] = 77
+    cfg["restricted_role"] = 999
+    cfg["approved_hashes"] = []
+    att = FakeAttachment("bad.png", (200, 10, 10))
+    raw = await att.read()
+    cfg["blocked_hashes"] = {
+        hashlib.sha256(raw).hexdigest(): {
+            "category": "gore",
+            "confidence": 0.9,
+            "reason": "cached",
+        }
+    }
+    msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "reposting disapproved image")
+    await sentry.process(msg, [att], cfg)
+    print("\n=== disapproved cache (image a mod rejected) ===")
+    print(f"  api calls (want 0)         : {len(CALLS)}")
+    print(f"  message deleted (want Yes) : {msg.deleted}")
 
 
 asyncio.run(main())

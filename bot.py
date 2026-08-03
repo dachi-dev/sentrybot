@@ -109,6 +109,7 @@ class State:
                 "sensitivity": "standard",  # relaxed | standard | strict
                 "exempt_channels": [],
                 "approved_hashes": [],  # sha256s a mod approved; never re-flagged
+                "blocked_hashes": {},  # sha256 -> verdict; reposts skip Claude
             },
         )
 
@@ -306,6 +307,7 @@ class Sentry(discord.Client):
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession()
         self.add_view(ReviewView())  # persistent buttons survive restarts
+        self.add_view(UndoApprovalView())
         await self.tree.sync()
 
     async def close(self):
@@ -479,11 +481,19 @@ class ReviewView(discord.ui.View):
                 log.exception("could not read case attachment for repost")
 
         # Whitelist these images so the repost — and any future post of them — is
-        # not flagged again.
+        # not flagged again, and drop them from the disapproved cache.
         cfg = state.guild(interaction.guild.id)
         approved = cfg.setdefault("approved_hashes", [])
-        if any(h not in approved for h in hashes):
-            approved.extend(h for h in hashes if h not in approved)
+        blocked = cfg.setdefault("blocked_hashes", {})
+        changed = False
+        for h in hashes:
+            if h not in approved:
+                approved.append(h)
+                changed = True
+            if h in blocked:
+                del blocked[h]
+                changed = True
+        if changed:
             state.save()
 
         reposted = False
@@ -517,7 +527,14 @@ class ReviewView(discord.ui.View):
             if reposted
             else "repost failed — user notified they can repost."
         )
-        await _close_case(interaction, note, discord.Colour.green(), deferred=True)
+        # Close the case: drop the image from the mod channel, keep the record, and
+        # leave a single "Undo approval" control that works off the stored fingerprint.
+        embed = interaction.message.embeds[0]
+        embed.colour = discord.Colour.green()
+        embed.add_field(name="Resolution", value=note, inline=False)
+        await interaction.message.edit(
+            embed=embed, view=UndoApprovalView(), attachments=[]
+        )
 
 
 def _case_field(message: discord.Message, name: str) -> int | None:
@@ -539,6 +556,17 @@ def _case_user_id(message: discord.Message) -> int | None:
 
 def _case_channel_id(message: discord.Message) -> int | None:
     return _case_field(message, "Origin")
+
+
+def _case_hashes(message: discord.Message) -> list[str]:
+    """The sha256 fingerprints stored on a case, so an approval can be undone
+    after the image itself has been removed from the channel."""
+    if not message.embeds:
+        return []
+    for field in message.embeds[0].fields:
+        if field.name == "Fingerprint":
+            return re.findall(r"[a-f0-9]{64}", field.value or "")
+    return []
 
 
 async def _resolve_member(
@@ -568,10 +596,53 @@ async def _close_case(
     embed.colour = colour
     embed.add_field(name="Resolution", value=note, inline=False)
     view = discord.ui.View()  # strip buttons
+    # Drop the flagged image from the mod channel once reviewed — don't let the
+    # server hoard potentially-harmful content.
     if deferred:
-        await interaction.message.edit(embed=embed, view=view)
+        await interaction.message.edit(embed=embed, view=view, attachments=[])
     else:
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=embed, view=view, attachments=[])
+
+
+class UndoApprovalView(discord.ui.View):
+    """A single 'Undo approval' button left on a closed, approved case. It reverses
+    the approval using the stored fingerprint, so no one re-handles the image."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message(
+                "You need Manage Messages to action this case.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Undo approval",
+        style=discord.ButtonStyle.secondary,
+        custom_id="sentry:unapprove",
+    )
+    async def undo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        cfg = state.guild(interaction.guild.id)
+        approved = cfg.setdefault("approved_hashes", [])
+        removed = 0
+        for h in _case_hashes(interaction.message):
+            if h in approved:
+                approved.remove(h)
+                removed += 1
+        if removed:
+            state.save()
+        embed = interaction.message.embeds[0]
+        embed.colour = discord.Colour.orange()
+        embed.add_field(
+            name="Approval reversed",
+            value=f"by {interaction.user.mention} — this image will be scanned again.",
+            inline=False,
+        )
+        await interaction.message.edit(embed=embed, view=discord.ui.View())
 
 
 # --------------------------------------------------------------------------
@@ -632,17 +703,28 @@ async def process(
     if not payloads:
         return
 
-    # Images a moderator has explicitly approved are never re-flagged, no matter
-    # who reposts them. This also skips the API call (and its cost) for them.
+    # A moderator's decisions are remembered so reposts never hit Claude again:
+    # approved images pass untouched; disapproved ones re-block straight from cache.
     approved = set(cfg.get("approved_hashes", []))
+    blocked = cfg.get("blocked_hashes", {})
 
     async def verdict_for(att: discord.Attachment, raw: bytes) -> dict:
-        if hashlib.sha256(raw).hexdigest() in approved:
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest in approved:
             return {
                 "verdict": "allow",
                 "category": "approved",
                 "confidence": 1.0,
                 "reason": "previously approved by a moderator",
+                "error": False,
+            }
+        if digest in blocked:
+            v = blocked[digest]
+            return {
+                "verdict": "block",
+                "category": v.get("category", "blocked"),
+                "confidence": v.get("confidence", 1.0),
+                "reason": v.get("reason", "previously flagged"),
                 "error": False,
             }
         return await classify(raw, att.content_type or "image/png", sensitivity)
@@ -735,6 +817,28 @@ async def open_case(
             name="Message text", value=message.content[:500], inline=False
         )
 
+    # Remember these verdicts so a repost of the same bytes never calls Claude
+    # again — it short-circuits to this block in process().
+    blocked = cfg.setdefault("blocked_hashes", {})
+    changed = False
+    for att, raw, v in flagged:
+        if v.get("error") or v.get("category") in (None, "check_failed", "unscannable"):
+            continue
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest not in blocked:
+            blocked[digest] = {
+                "category": v.get("category"),
+                "confidence": v.get("confidence", 0.0),
+                "reason": v.get("reason", ""),
+            }
+            changed = True
+    if len(blocked) > 10000:  # keep the state file bounded
+        for old in list(blocked)[: len(blocked) - 10000]:
+            del blocked[old]
+        changed = True
+    if changed:
+        state.save()
+
     files = []
     if critical:
         # Never re-upload suspected CSAM. Escalate without redistributing.
@@ -745,7 +849,13 @@ async def open_case(
             "reports also go to NCMEC CyberTipline: <https://report.cybertip.org>."
         )
     else:
-        embed.set_footer(text="Attachments are spoilered. Review with care.")
+        # Fingerprint the attached images so an approval can be undone later without
+        # the bot needing to keep the image around after the case is resolved.
+        fps = [hashlib.sha256(raw).hexdigest() for _, raw, _ in flagged[:5]]
+        embed.add_field(name="Fingerprint", value=" ".join(fps), inline=False)
+        embed.set_footer(
+            text="Attachments are spoilered and removed once the case is resolved."
+        )
         for att, raw, _ in flagged[:5]:
             files.append(
                 discord.File(io.BytesIO(raw), filename=f"SPOILER_{att.filename}")
@@ -887,6 +997,12 @@ async def status_cmd(interaction: discord.Interaction):
     )
     embed.add_field(name="On check failure", value=FAIL_MODE, inline=True)
     embed.add_field(name="Downscale", value=f"{MAX_EDGE}px long edge", inline=True)
+    embed.add_field(
+        name="Remembered",
+        value=f"{len(cfg.get('approved_hashes', []))} approved · "
+        f"{len(cfg.get('blocked_hashes', {}))} blocked",
+        inline=True,
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
