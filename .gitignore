@@ -1,0 +1,13 @@
+# Secrets — never commit these
+.env
+*.pem
+
+# Runtime state
+sentry_state.json
+sentry_state.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
