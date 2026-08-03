@@ -117,7 +117,7 @@ async def scenario(label, verdict, attachments, *, raise_error=False):
     CALLS.clear()
     sentry.verdict_cache.clear()
     NEXT_VERDICT.clear()
-    NEXT_VERDICT.update(payload=verdict, raise_error=raise_error)
+    NEXT_VERDICT.update(payload=verdict)
     NEXT_VERDICT["raise"] = raise_error
 
     guild = FakeGuild()

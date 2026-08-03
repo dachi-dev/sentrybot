@@ -104,7 +104,11 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
 - **Lower `SENTRY_MAX_EDGE` to 512** to roughly halve tokens and shave latency; obvious
   cases hold up well, borderline cases degrade.
 - **Videos are not scanned.** Claude vision takes images only.
-- Moderators (anyone with Manage Messages) bypass scanning entirely.
+- Every member is scanned, including moderators and admins. Note that the
+  `Media Restricted` role cannot actually constrain a user with Administrator or
+  the server owner — Discord permissions override channel overwrites for them — so
+  their flagged images are still deleted and a case still opens, but no restriction
+  sticks.
 
 ## Operational notes
 

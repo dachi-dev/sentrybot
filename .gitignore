@@ -6,6 +6,9 @@
 sentry_state.json
 sentry_state.tmp
 
+# macOS
+.DS_Store
+
 # Python
 __pycache__/
 *.py[cod]

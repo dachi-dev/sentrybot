@@ -501,8 +501,6 @@ async def on_message(message: discord.Message):
         return
     if message.channel.id == cfg.get("review_channel"):
         return
-    if message.author.guild_permissions.manage_messages:
-        return  # moderators bypass the buffer
 
     attachments = image_attachments(message)
     if not attachments:
