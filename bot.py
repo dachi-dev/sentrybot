@@ -110,6 +110,7 @@ class State:
                 "exempt_channels": [],
                 "approved_hashes": [],  # sha256s a mod approved; never re-flagged
                 "blocked_hashes": {},  # sha256 -> verdict; reposts skip Claude
+                "approved_posts": {},  # sha256 -> [[channel_id, message_id]] reposts
             },
         )
 
@@ -519,6 +520,17 @@ def _case_hashes(message: discord.Message) -> list[str]:
     return []
 
 
+def _case_category(message: discord.Message) -> str | None:
+    """The category recorded on a case, used to re-block on undo."""
+    if not message.embeds:
+        return None
+    for field in message.embeds[0].fields:
+        if field.name == "Category":
+            m = re.search(r"`([a-z_]+)`", field.value or "")
+            return m.group(1) if m else None
+    return None
+
+
 async def _resolve_member(
     guild: discord.Guild, user_id: int | None
 ) -> discord.Member | None:
@@ -534,43 +546,6 @@ async def _resolve_member(
         return await guild.fetch_member(user_id)
     except discord.HTTPException:
         return None
-
-
-async def _purge_image_from_channel(
-    guild: discord.Guild, channel_id: int | None, hashes: set[str], limit: int = 100
-) -> int:
-    """Best-effort: delete recent non-bot messages in a channel whose image
-    attachments match any of the given sha256s. Used to clean up a repost after an
-    approval is undone. Only scans the last `limit` messages."""
-    if not hashes or channel_id is None:
-        return 0
-    channel = guild.get_channel(channel_id)
-    if channel is None:
-        return 0
-    deleted = 0
-    try:
-        async for msg in channel.history(limit=limit):
-            if msg.author.bot:
-                continue
-            match = False
-            for att in msg.attachments:
-                if not (att.content_type or "").startswith("image/"):
-                    continue
-                try:
-                    if hashlib.sha256(await att.read()).hexdigest() in hashes:
-                        match = True
-                        break
-                except Exception:
-                    continue
-            if match:
-                try:
-                    await msg.delete()
-                    deleted += 1
-                except discord.HTTPException:
-                    pass
-    except discord.Forbidden:
-        log.warning("cannot scan channel %s to remove reposts", channel_id)
-    return deleted
 
 
 async def _flip_restriction(
@@ -637,21 +612,33 @@ class UndoApprovalView(discord.ui.View):
         await interaction.response.defer()
         cfg = state.guild(interaction.guild.id)
         approved = cfg.setdefault("approved_hashes", [])
+        blocked = cfg.setdefault("blocked_hashes", {})
+        approved_posts = cfg.setdefault("approved_posts", {})
         hashes = set(_case_hashes(interaction.message))
-        removed = 0
-        for h in list(hashes):
+        category = _case_category(interaction.message) or "blocked"
+
+        deleted = 0
+        for h in hashes:
             if h in approved:
                 approved.remove(h)
-                removed += 1
-        # Removing from the allow-list re-activates the retained block-cache entry,
-        # so the image is disapproved again with no fresh Claude call.
-        if removed:
-            state.save()
-
-        # Delete any repost of the image already sitting in the origin channel.
-        deleted = await _purge_image_from_channel(
-            interaction.guild, _case_channel_id(interaction.message), hashes
-        )
+            # Explicitly (re-)block so the image can never be posted again — don't
+            # rely on a leftover cache entry that may have been evicted.
+            blocked[h] = {
+                "category": category,
+                "confidence": 1.0,
+                "reason": "approval reversed by a moderator",
+            }
+            # Delete every message where the image was reposted while approved.
+            for cid, mid in approved_posts.pop(h, []):
+                ch = interaction.guild.get_channel(cid)
+                if ch is None:
+                    continue
+                try:
+                    await ch.get_partial_message(mid).delete()
+                    deleted += 1
+                except discord.HTTPException:
+                    pass
+        state.save()
 
         embed = interaction.message.embeds[0]
         embed.colour = discord.Colour.orange()
@@ -798,6 +785,17 @@ async def process(
         return await classify(raw, att.content_type or "image/png", sensitivity)
 
     results = await asyncio.gather(*(verdict_for(att, raw) for att, raw in payloads))
+
+    # Remember where an allow-listed image is (re)posted, so undoing its approval
+    # can delete exactly those messages later — no history-scanning guesswork.
+    if any(v.get("category") == "approved" for v in results):
+        approved_posts = cfg.setdefault("approved_posts", {})
+        for (att, raw), v in zip(payloads, results):
+            if v.get("category") == "approved":
+                approved_posts.setdefault(
+                    hashlib.sha256(raw).hexdigest(), []
+                ).append([channel.id, message.id])
+        state.save()
 
     flagged = [
         (att, raw, v) for (att, raw), v in zip(payloads, results) if v["verdict"] == "block"

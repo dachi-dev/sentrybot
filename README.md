@@ -104,8 +104,9 @@ Three buttons:
   keeps a single **Undo approval** button.
 - **Undo approval** (shown only after Approve) — reverses the approval via the stored
   fingerprint: the image is **blocked again** (any new post of it is deleted with no Claude
-  call), and any repost already sitting in the origin channel is **deleted** (best-effort
-  scan of the last 100 messages). No one has to re-handle the image.
+  call), and **every repost the bot saw while it was approved is deleted** — their message
+  IDs are tracked in state, so cleanup is exact, not a history scan. No one re-handles the
+  image.
 
 **Exception:** if Claude classifies something as sexual content involving a minor, the
 image is **not** re-uploaded to the review channel. The case carries metadata only, plus

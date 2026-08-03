@@ -109,6 +109,7 @@ class FakeMessage:
         self.author = FakeMember(guild)
         self.attachments, self.content = attachments, content
         self.deleted = False
+        self.id = 555
 
     async def delete(self):
         self.deleted = True
