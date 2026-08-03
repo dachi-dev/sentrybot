@@ -83,11 +83,14 @@ reason. The flagged images are attached with `SPOILER_` filenames so they stay b
 until a moderator clicks — this is the only surviving copy once the original is deleted,
 so the review channel should be mod-only.
 
-Three buttons: **Restore access**, **Uphold restriction**, and **False positive** —
-which restores access, **re-posts the cleared image** (un-spoilered) back to its
-origin channel credited to the original author, and DMs the user that it's back. If
-the origin channel is gone or unwritable, it falls back to telling the user they may
-repost it themselves.
+Three buttons:
+
+- **Restore access** — lifts the restriction, nothing else.
+- **Uphold restriction** — keeps the restriction; closes the case.
+- **Approve (return to user)** — restores access and **DMs the image back to the author**
+  so they can repost it themselves, rather than the bot reposting on their behalf. Use
+  this when you'd rather the cleared image reappear as the user's own genuine post. If
+  the user has DMs closed, the case notes that it couldn't be delivered.
 
 **Exception:** if Claude classifies something as sexual content involving a minor, the
 image is **not** re-uploaded to the review channel. The case carries metadata only, plus

@@ -438,16 +438,15 @@ class ReviewView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="False positive",
-        style=discord.ButtonStyle.secondary,
-        custom_id="sentry:falsepos",
+        label="Approve (return to user)",
+        style=discord.ButtonStyle.primary,
+        custom_id="sentry:approve_return",
     )
-    async def false_positive(
+    async def approve_return(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        """Restore access and re-post the cleared image to its origin channel."""
-        # Re-posting means downloading and re-uploading the image, so acknowledge
-        # the interaction first to avoid the 3s "did not respond" timeout.
+        """Restore access and DM the cleared image back to the author so they can
+        repost it themselves, rather than the bot reposting on their behalf."""
         await interaction.response.defer()
         member = await _resolve_member(
             interaction.guild, _case_user_id(interaction.message)
@@ -456,14 +455,13 @@ class ReviewView(discord.ui.View):
             await interaction.followup.send("Member not found.", ephemeral=True)
             return
 
-        await unrestrict(member, f"false positive cleared by {interaction.user}")
+        await unrestrict(member, f"approved by {interaction.user}")
 
         channel_id = _case_channel_id(interaction.message)
-        origin = interaction.guild.get_channel(channel_id) if channel_id else None
-        where = origin.mention if origin else "the channel"
+        where = f"<#{channel_id}>" if channel_id else "the channel"
 
-        # The flagged image now survives only as the spoilered copy on this case.
-        # Re-upload it, un-spoilered, credited to the original author.
+        # Hand the actual image bytes back to the user; the original was deleted,
+        # so without this they'd have nothing to repost.
         files = []
         for att in interaction.message.attachments:
             name = att.filename
@@ -472,41 +470,27 @@ class ReviewView(discord.ui.View):
             try:
                 files.append(discord.File(io.BytesIO(await att.read()), filename=name))
             except Exception:
-                log.exception("could not read case attachment for repost")
+                log.exception("could not read case attachment to return to user")
 
-        reposted = False
-        if origin is not None and files:
-            try:
-                await origin.send(
-                    content=f"{member.mention} — image restored by a moderator "
-                    "(cleared as a false positive):",
-                    files=files,
-                    allowed_mentions=discord.AllowedMentions(
-                        everyone=False, roles=False, users=False
-                    ),
-                )
-                reposted = True
-            except discord.Forbidden:
-                log.warning("cannot repost cleared image to %s", origin)
-
+        body = (
+            f"Your image in **{interaction.guild.name}** was approved by a moderator. "
+            f"Your permissions are restored and the image is attached here — you can "
+            f"post it again yourself in {where}."
+        )
+        sent = False
         try:
-            if reposted:
-                await member.send(
-                    f"A moderator in **{interaction.guild.name}** cleared your image as a "
-                    f"false positive. Your permissions are restored and the image has been "
-                    f"re-posted for you in {where}."
-                )
+            if files:
+                await member.send(body, files=files)
             else:
-                await member.send(
-                    f"A moderator in **{interaction.guild.name}** cleared your image as a "
-                    f"false positive. Your image permissions are restored and you're "
-                    f"welcome to post it again in {where}."
-                )
+                await member.send(body)
+            sent = True
         except discord.Forbidden:
             pass
 
-        note = f"Marked false positive by {interaction.user.mention}; access restored and " + (
-            f"image re-posted in {where}." if reposted else "user notified they can repost."
+        note = f"Approved by {interaction.user.mention}; access restored and " + (
+            "image sent to the user to repost."
+            if sent
+            else "user has DMs closed — image could not be delivered."
         )
         await _close_case(interaction, note, discord.Colour.green(), deferred=True)
 
