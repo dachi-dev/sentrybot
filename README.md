@@ -91,8 +91,11 @@ Discord. The stored fingerprint is what lets later actions work without the imag
 
 Three buttons:
 
-- **Restore access** — lifts the restriction, nothing else.
-- **Uphold restriction** — keeps the restriction; closes the case.
+- **Restore access** — lifts the restriction, then leaves a **Re-restrict** button so
+  the decision can be reversed.
+- **Uphold restriction** — keeps the restriction, then leaves a **Restore access** button
+  so it can still be lifted later. (Restore ↔ Re-restrict toggle indefinitely; resolutions
+  are never a dead end.)
 - **Approve** — restores access, **adds the image's hash to a per-server allow-list**, and
   **DMs the user** that they may repost it themselves. The bot never reposts on the user's
   behalf; because the image is allow-listed, the user's own repost — and any future post of

@@ -308,6 +308,8 @@ class Sentry(discord.Client):
         self.http_session = aiohttp.ClientSession()
         self.add_view(ReviewView())  # persistent buttons survive restarts
         self.add_view(UndoApprovalView())
+        self.add_view(UpheldView())
+        self.add_view(RestoredView())
         await self.tree.sync()
 
     async def close(self):
@@ -411,22 +413,7 @@ class ReviewView(discord.ui.View):
         custom_id="sentry:restore",
     )
     async def restore(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        member = await _resolve_member(
-            interaction.guild, _case_user_id(interaction.message)
-        )
-        if member is None:
-            await interaction.followup.send("Member not found.", ephemeral=True)
-            return
-        ok = await unrestrict(member, f"cleared by {interaction.user}")
-        await _close_case(
-            interaction,
-            f"Access restored by {interaction.user.mention}."
-            if ok
-            else f"{interaction.user.mention} marked resolved (no active restriction).",
-            discord.Colour.green(),
-            deferred=True,
-        )
+        await _flip_restriction(interaction, restore=True, first_time=True)
 
     @discord.ui.button(
         label="Uphold restriction",
@@ -434,11 +421,7 @@ class ReviewView(discord.ui.View):
         custom_id="sentry:uphold",
     )
     async def uphold(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _close_case(
-            interaction,
-            f"Restriction upheld by {interaction.user.mention}.",
-            discord.Colour.dark_red(),
-        )
+        await _flip_restriction(interaction, restore=False, first_time=True)
 
     @discord.ui.button(
         label="Approve",
@@ -558,22 +541,44 @@ async def _resolve_member(
         return None
 
 
-async def _close_case(
-    interaction: discord.Interaction,
-    note: str,
-    colour: discord.Colour,
-    deferred: bool = False,
+async def _flip_restriction(
+    interaction: discord.Interaction, *, restore: bool, first_time: bool
 ):
+    """Restore or re-apply a user's restriction from a case, always leaving the
+    reverse action as a button so a decision is never a dead end. Also drops the
+    flagged image from the mod channel so it isn't hoarded."""
+    await interaction.response.defer()
+    member = await _resolve_member(
+        interaction.guild, _case_user_id(interaction.message)
+    )
+    if member is None:
+        await interaction.followup.send("Member not found.", ephemeral=True)
+        return
+
+    if restore:
+        ok = await unrestrict(member, f"restored by {interaction.user}")
+        note = (
+            f"Access restored by {interaction.user.mention}."
+            if ok
+            else f"{interaction.user.mention} marked resolved (no active restriction)."
+        )
+        colour, next_view = discord.Colour.green(), RestoredView()
+    else:
+        ok = await restrict(member, f"restriction upheld by {interaction.user}")
+        note = (
+            f"Restriction upheld by {interaction.user.mention}."
+            if ok
+            else f"{interaction.user.mention} — could not apply the restriction "
+            "(check my role position)."
+        )
+        colour, next_view = discord.Colour.dark_red(), UpheldView()
+
     embed = interaction.message.embeds[0]
     embed.colour = colour
-    embed.add_field(name="Resolution", value=note, inline=False)
-    view = discord.ui.View()  # strip buttons
-    # Drop the flagged image from the mod channel once reviewed — don't let the
-    # server hoard potentially-harmful content.
-    if deferred:
-        await interaction.message.edit(embed=embed, view=view, attachments=[])
-    else:
-        await interaction.response.edit_message(embed=embed, view=view, attachments=[])
+    embed.add_field(
+        name="Resolution" if first_time else "Update", value=note, inline=False
+    )
+    await interaction.message.edit(embed=embed, view=next_view, attachments=[])
 
 
 class UndoApprovalView(discord.ui.View):
@@ -615,6 +620,55 @@ class UndoApprovalView(discord.ui.View):
             inline=False,
         )
         await interaction.message.edit(embed=embed, view=discord.ui.View())
+
+
+class UpheldView(discord.ui.View):
+    """Left on an upheld (still-restricted) case so a moderator can restore
+    access later — the decision is never a dead end."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message(
+                "You need Manage Messages to action this case.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Restore access",
+        style=discord.ButtonStyle.success,
+        custom_id="sentry:restore_flip",
+    )
+    async def restore(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _flip_restriction(interaction, restore=True, first_time=False)
+
+
+class RestoredView(discord.ui.View):
+    """Left on a restored case so a moderator can re-apply the restriction."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message(
+                "You need Manage Messages to action this case.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Re-restrict",
+        style=discord.ButtonStyle.danger,
+        custom_id="sentry:rerestrict",
+    )
+    async def rerestrict(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await _flip_restriction(interaction, restore=False, first_time=False)
 
 
 # --------------------------------------------------------------------------
