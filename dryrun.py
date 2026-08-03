@@ -159,9 +159,16 @@ async def main():
         "confidence": 0.88,
         "reason": "policy violation",
     }
+    hate = {
+        "verdict": "block",
+        "category": "hate_symbol",
+        "confidence": 0.9,
+        "reason": "extremist hate symbol",
+    }
 
     await scenario("clean image passes untouched", clean, [FakeAttachment("cat.png", (90, 160, 90))])
     await scenario("gore flagged", gore, [FakeAttachment("bad.png", (170, 20, 20))])
+    await scenario("hate symbol flagged", hate, [FakeAttachment("flag.png", (30, 30, 30))])
     await scenario(
         "mixed message, one bad attachment",
         gore,

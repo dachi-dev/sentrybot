@@ -1,8 +1,9 @@
 # Sentry — Claude-backed image moderation for Discord
 
-Watches uploaded images, sends each one to Claude vision, and deletes anything
-classified as nudity or gore. The poster loses image permissions and a case lands in
-your review channel with approve/uphold buttons.
+Watches uploaded images, sends each one to Claude vision, and deletes anything that
+doesn't belong on a general-audience server — nudity, gore, hate symbols, credible
+threats, doxxing, self-harm, hard drugs, and scam/spam. The poster loses image
+permissions and a case lands in your review channel with approve/uphold buttons.
 
 Clean images are never touched — they keep their real author, replies, reactions and
 edit history. Single file, no database, ~800 input tokens per image.
@@ -82,8 +83,11 @@ reason. The flagged images are attached with `SPOILER_` filenames so they stay b
 until a moderator clicks — this is the only surviving copy once the original is deleted,
 so the review channel should be mod-only.
 
-Three buttons: **Restore access**, **Uphold restriction**, and **False positive**, which
-restores access and DMs the user that they are free to post the image again.
+Three buttons: **Restore access**, **Uphold restriction**, and **False positive** —
+which restores access, **re-posts the cleared image** (un-spoilered) back to its
+origin channel credited to the original author, and DMs the user that it's back. If
+the origin channel is gone or unwritable, it falls back to telling the user they may
+repost it themselves.
 
 **Exception:** if Claude classifies something as sexual content involving a minor, the
 image is **not** re-uploaded to the review channel. The case carries metadata only, plus
@@ -94,7 +98,11 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
 - **False positives** are the main failure mode, and they now cost a real deletion. The
   prompt explicitly calibrates swimwear, shirtless people, cosplay, game screenshots and
   horror makeup as clean. Start on `standard`; move to `relaxed` if your community posts
-  a lot of fighting-game or medical content.
+  a lot of fighting-game or medical content. The broader categories (hate symbols, drugs,
+  scam/spam, etc.) widen the false-positive surface — hate-symbol detection in particular
+  has to tell WWII history, the Hindu/Buddhist swastika, and anti-hate imagery apart from
+  the real thing — so when a clean image does get caught, the **False positive** review
+  button restores it *and* re-posts it, keeping the cost of a mistake low.
 - **`SENTRY_FAIL_MODE=closed`** (default) deletes when the API errors. On a provider
   outage that means every image in the server gets deleted — `open` is the safer default
   for large servers, since a missed image is usually cheaper than mass false deletions.

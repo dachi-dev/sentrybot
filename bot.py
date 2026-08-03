@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -127,35 +128,65 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 check_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 verdict_cache: "OrderedDict[str, dict]" = OrderedDict()
 
-SYSTEM_PROMPT = """You are an image safety classifier for a Discord server. \
-You receive one image and return a single JSON object. You never describe the \
-image in detail, never narrate its contents, and never output anything except JSON.
+SYSTEM_PROMPT = """You are an image safety classifier for a general-audience \
+Discord server. You receive one image and return a single JSON object. You never \
+describe the image in detail, never narrate its contents, and never output anything \
+except JSON.
 
-Categories:
+Your job is to flag images that do not belong on a general-audience community \
+server. Categories:
 - "sexual_nudity": exposed genitals, anus, or female nipples; sexual acts; \
 sexually explicit posing or content clearly intended to arouse.
 - "gore": graphic injury, mutilation, visible internal anatomy, significant \
 blood from real trauma, corpses, animal cruelty, real-world death.
 - "minor_sexual": any sexualized depiction of a person who appears to be a minor. \
 This overrides every other category.
+- "hate_symbol": Nazi, SS, KKK, or other recognized white-supremacist, extremist, \
+or terrorist symbols, flags, or salutes; hateful slurs rendered in the image; \
+dehumanizing hateful caricatures of a protected group.
+- "violence_threat": glorification or promotion of terrorism or mass violence; a \
+credible real-world threat; a weapon brandished to menace a specific person.
+- "harassment_doxxing": an image posted to expose a private individual's personal \
+information (home address, phone number, government ID, financial details) or to \
+demean and harass a specific person.
+- "self_harm": depiction, instruction, or promotion of suicide or self-harm.
+- "drugs": use, sale, or promotion of hard or illegal drugs.
+- "scam_spam": phishing, fraudulent giveaways or investment/crypto scams, QR codes \
+or links presented to defraud, or mass unsolicited advertising.
 - "clean": everything else.
 
-Calibration:
-- Swimwear, underwear, shirtless people, athletic wear, artistic non-explicit \
-figure studies, cleavage, and cosplay are CLEAN.
+Calibration — these are CLEAN:
+- Swimwear, underwear, shirtless people, athletic wear, non-explicit figure \
+studies, cleavage, and cosplay.
 - Stylized cartoon violence, video game screenshots, horror movie makeup, film \
-stills, memes with fake blood, and medical or educational diagrams are CLEAN.
+stills, memes with fake blood, and medical or educational diagrams.
+- Historical and educational material: WWII documentary photos, museum pieces, \
+news reporting, and anti-hate imagery such as a crossed-out swastika.
+- The Hindu, Buddhist, or Jain swastika and similar religious symbols in a genuine \
+cultural or religious context — not every swastika is a hate symbol.
+- Lawful weapons in ordinary context (hunting, sport, collecting, game \
+screenshots), and alcohol or tobacco in ordinary social use.
+- Jokes, satire, and edgy humor that do not actually promote harm.
+
+Rules:
 - Real photographic injury, real accident and war footage, and surgical footage \
 are GORE even when the intent is educational.
-- Judge what is depicted, not what is implied by any text in the image.
+- Judge what is depicted. For hate_symbol, scam_spam, harassment_doxxing and \
+self_harm, any text and context shown in the image are part of what is depicted \
+and should be weighed.
+- When something is borderline and could plausibly be innocuous, prefer "clean". A \
+wrong block deletes a real user's message.
+- Set "verdict" to "block" for any category other than "clean"; use "allow" only \
+for "clean".
 
 Sensitivity level "{sensitivity}":
 - relaxed: flag only unambiguous, explicit cases.
 - standard: flag when a reasonable moderator on a general-audience server would.
-- strict: also flag suggestive-but-not-explicit sexual content and moderate blood.
+- strict: also flag suggestive-but-not-explicit sexual content, moderate blood, \
+and borderline cases in the other categories.
 
 Respond with exactly this JSON shape and nothing else:
-{{"verdict": "allow" | "block", "category": "clean" | "sexual_nudity" | "gore" | "minor_sexual", "confidence": 0.0-1.0, "reason": "<max 12 words, non-graphic>"}}"""
+{{"verdict": "allow" | "block", "category": "clean" | "sexual_nudity" | "gore" | "minor_sexual" | "hate_symbol" | "violence_threat" | "harassment_doxxing" | "self_harm" | "drugs" | "scam_spam", "confidence": 0.0-1.0, "reason": "<max 12 words, non-graphic>"}}"""
 
 
 def _cache_get(key: str) -> dict | None:
@@ -411,31 +442,69 @@ class ReviewView(discord.ui.View):
     async def false_positive(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        """Restore access and tell the user they may post the image again."""
+        """Restore access and re-post the cleared image to its origin channel."""
         user_id = _case_user_id(interaction.message)
         member = interaction.guild.get_member(user_id) if user_id else None
         if member is None:
             await interaction.response.send_message("Member not found.", ephemeral=True)
             return
 
+        # Re-posting means downloading and re-uploading the image, so acknowledge
+        # the interaction first to avoid the 3s "did not respond" timeout.
+        await interaction.response.defer()
         await unrestrict(member, f"false positive cleared by {interaction.user}")
+
         channel_id = _case_channel_id(interaction.message)
-        where = f"<#{channel_id}>" if channel_id else "the channel"
+        origin = interaction.guild.get_channel(channel_id) if channel_id else None
+        where = origin.mention if origin else "the channel"
+
+        # The flagged image now survives only as the spoilered copy on this case.
+        # Re-upload it, un-spoilered, credited to the original author.
+        files = []
+        for att in interaction.message.attachments:
+            name = att.filename
+            if name.startswith("SPOILER_"):
+                name = name[len("SPOILER_") :]
+            try:
+                files.append(discord.File(io.BytesIO(await att.read()), filename=name))
+            except Exception:
+                log.exception("could not read case attachment for repost")
+
+        reposted = False
+        if origin is not None and files:
+            try:
+                await origin.send(
+                    content=f"{member.mention} — image restored by a moderator "
+                    "(cleared as a false positive):",
+                    files=files,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, roles=False, users=False
+                    ),
+                )
+                reposted = True
+            except discord.Forbidden:
+                log.warning("cannot repost cleared image to %s", origin)
+
         try:
-            await member.send(
-                f"A moderator in **{interaction.guild.name}** reviewed your image and "
-                f"cleared it as a false positive. Your image permissions are restored "
-                f"and you're welcome to post it again in {where}."
-            )
+            if reposted:
+                await member.send(
+                    f"A moderator in **{interaction.guild.name}** cleared your image as a "
+                    f"false positive. Your permissions are restored and the image has been "
+                    f"re-posted for you in {where}."
+                )
+            else:
+                await member.send(
+                    f"A moderator in **{interaction.guild.name}** cleared your image as a "
+                    f"false positive. Your image permissions are restored and you're "
+                    f"welcome to post it again in {where}."
+                )
         except discord.Forbidden:
             pass
 
-        await _close_case(
-            interaction,
-            f"Marked false positive by {interaction.user.mention}; access restored and "
-            f"user notified they can repost.",
-            discord.Colour.green(),
+        note = f"Marked false positive by {interaction.user.mention}; access restored and " + (
+            f"image re-posted in {where}." if reposted else "user notified they can repost."
         )
+        await _close_case(interaction, note, discord.Colour.green(), deferred=True)
 
 
 def _case_field(message: discord.Message, name: str) -> int | None:
@@ -443,8 +512,11 @@ def _case_field(message: discord.Message, name: str) -> int | None:
         return None
     for field in message.embeds[0].fields:
         if field.name == name:
-            digits = "".join(c for c in field.value if c.isdigit())
-            return int(digits) if digits else None
+            # The ID is stored inside backticks, e.g. "<@123> (`123`)". A plain
+            # digit filter would also pick up the mention's copy of the ID and
+            # concatenate the two into a bogus number.
+            m = re.search(r"`(\d+)`", field.value or "")
+            return int(m.group(1)) if m else None
     return None
 
 
