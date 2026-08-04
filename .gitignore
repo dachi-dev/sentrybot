@@ -5,6 +5,9 @@
 # Runtime state
 sentry_state.json
 sentry_state.tmp
+audit.jsonl
+audit.jsonl.*
+blocked/
 
 # macOS
 .DS_Store
