@@ -37,6 +37,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry sensitivity` | `relaxed` / `standard` / `strict` (what Claude flags) |
 | `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
 | `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`); CSAM can't be disabled |
+| `/sentry dryrun` | Observe-only mode: report flags to the review channel, remove nothing (CSAM still removed) |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |

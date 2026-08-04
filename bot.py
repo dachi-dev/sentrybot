@@ -155,6 +155,7 @@ class State:
                 "approved_posts": {},  # sha256 -> [[channel_id, message_id]] reposts
                 "min_confidence": DEFAULT_MIN_CONFIDENCE,  # quarantine threshold
                 "disabled_categories": [],  # categories a mod turned off
+                "dry_run": False,  # report flags but take no action (except CSAM)
             },
         )
 
@@ -1107,6 +1108,44 @@ async def _log_check_failure(message: discord.Message, errored: list, cfg: dict)
         log.warning("cannot post check-failure notice to review channel")
 
 
+async def _log_dry_flag(message: discord.Message, flagged: list, cfg: dict):
+    """Dry-run notice: report what WOULD have been removed, take no action."""
+    review_id = cfg.get("review_channel")
+    review = message.guild.get_channel(review_id) if review_id else None
+    if review is None:
+        return
+    worst = max(flagged, key=lambda f: f[2].get("confidence", 0))[2]
+    embed = discord.Embed(
+        title="DRY RUN — would have removed (no action taken)",
+        colour=discord.Colour.gold(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)")
+    embed.add_field(
+        name="Channel", value=f"{message.channel.mention} (`{message.channel.id}`)"
+    )
+    embed.add_field(
+        name="Category",
+        value=f"`{worst.get('category')}` · confidence {worst.get('confidence', 0):.2f}",
+        inline=False,
+    )
+    embed.add_field(name="Reason", value=worst.get("reason") or "—", inline=False)
+    jump = getattr(message, "jump_url", None)
+    if jump:
+        embed.add_field(name="Message", value=f"[jump to it]({jump})", inline=False)
+    embed.set_footer(text="Dry run: image left up. Turn dry run off to enforce.")
+    files = [
+        discord.File(io.BytesIO(raw), filename=f"SPOILER_{name}")
+        for name, raw, _ in flagged[:5]
+    ]
+    try:
+        await review.send(
+            embed=embed, files=files, allowed_mentions=discord.AllowedMentions.none()
+        )
+    except discord.Forbidden:
+        log.warning("cannot post dry-run notice to review channel")
+
+
 async def process(
     message: discord.Message, attachments: list[discord.Attachment], cfg: dict
 ):
@@ -1211,6 +1250,27 @@ async def _run_moderation(
                 )
         return False  # clean, below the confidence threshold, or a failed check
 
+    critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
+
+    # Dry run: report to moderators but take no action — except suspected CSAM, which
+    # is always removed regardless.
+    if cfg.get("dry_run") and not critical:
+        for name, raw, v in flagged:
+            audit(
+                "dry_flag",
+                guild=message.guild.id,
+                channel=channel.id,
+                user=author.id,
+                message=message.id,
+                source=name,
+                category=v.get("category"),
+                confidence=v.get("confidence"),
+                reason=v.get("reason"),
+                sha256=hashlib.sha256(raw).hexdigest(),
+            )
+        await _log_dry_flag(message, flagged, cfg)
+        return False
+
     # A message is atomic — one bad item takes the whole message with it.
     try:
         await message.delete()
@@ -1220,7 +1280,6 @@ async def _run_moderation(
         pass  # already gone; still restrict and open the case
 
     worst = max(flagged, key=lambda f: f[2].get("confidence", 0))[2]
-    critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
     restricted = await restrict(author, f"flagged: {worst.get('category')}")
     _archive_blocked(flagged, critical)
 
@@ -1470,6 +1529,31 @@ async def category_cmd(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@mod.command(
+    name="dryrun",
+    description="Report flags to the review channel without removing anything",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="on — observe only, take no action", value="on"),
+        app_commands.Choice(name="off — enforce (remove flagged images)", value="off"),
+    ]
+)
+async def dryrun_cmd(
+    interaction: discord.Interaction, mode: app_commands.Choice[str]
+):
+    cfg = state.guild(interaction.guild.id)
+    cfg["dry_run"] = mode.value == "on"
+    state.save()
+    await interaction.response.send_message(
+        "Dry run is **ON** — flags are reported to the review channel but **nothing is "
+        "removed or restricted** (suspected CSAM is still removed)."
+        if cfg["dry_run"]
+        else "Dry run is **OFF** — flagged images are enforced normally.",
+        ephemeral=True,
+    )
+
+
 @mod.command(name="exclude", description="Exclude a channel from scanning (or re-include it)")
 @app_commands.describe(
     channel="Channel to exclude from moderation",
@@ -1540,6 +1624,10 @@ async def status_cmd(interaction: discord.Interaction):
     exempt = cfg["exempt_channels"]
     embed = discord.Embed(title="Sentry status", colour=discord.Colour.blurple())
     embed.add_field(name="Scanning", value="on" if cfg["enabled"] else "off")
+    embed.add_field(
+        name="Mode",
+        value="🟡 dry run (no action)" if cfg.get("dry_run") else "enforcing",
+    )
     embed.add_field(name="Sensitivity", value=cfg["sensitivity"])
     embed.add_field(name="Model", value=MODEL, inline=False)
     embed.add_field(

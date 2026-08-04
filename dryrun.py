@@ -317,6 +317,28 @@ async def main():
     print("\n=== disabled category (gore turned off) ===")
     print(f"  message deleted (want No): {msg.deleted}")
 
+    # dry run: a flagged image is reported to the review channel but NOT removed
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    NEXT_VERDICT.update(payload=gore)
+    NEXT_VERDICT["raise"] = False
+    guild = FakeGuild()
+    cfg = sentry.state.guild(guild.id)
+    cfg["review_channel"] = 77
+    cfg["restricted_role"] = 999
+    cfg["approved_hashes"] = []
+    cfg["blocked_hashes"] = {}
+    cfg["disabled_categories"] = []
+    cfg["dry_run"] = True
+    att = FakeAttachment("dry.png", (172, 22, 22))
+    msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "would be flagged")
+    await sentry.process(msg, [att], cfg)
+    notice = any(e[0] == "review_post" for e in EVENTS)
+    print("\n=== dry run (gore flagged, no enforcement) ===")
+    print(f"  message deleted (want No): {msg.deleted}")
+    print(f"  review notice posted (want Yes): {notice}")
+
     # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
     _hp = sentry.HAS_PIL
     sentry.HAS_PIL = False
