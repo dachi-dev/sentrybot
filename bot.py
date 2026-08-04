@@ -1071,6 +1071,19 @@ async def on_guild_join(guild: discord.Guild):
         log.exception("guild command sync on join failed for %s", guild.id)
 
 
+def _is_reviewer(guild: discord.Guild, member, cfg: dict) -> bool:
+    """True if `member` can see the review (mod) channel — i.e. they're staff and
+    exempt from moderation. Anyone who can read where cases are triaged is trusted.
+    False when the review channel is unset/gone or the author isn't a full member."""
+    review_id = cfg.get("review_channel")
+    if not review_id or not isinstance(member, discord.Member):
+        return False
+    review = guild.get_channel(review_id)
+    if review is None:
+        return False
+    return review.permissions_for(member).view_channel
+
+
 def _guild_scans(message: discord.Message, cfg: dict) -> bool:
     """Shared gate: is this a message in a scanned channel of an enabled guild?"""
     if message.author.bot or message.guild is None:
@@ -1079,6 +1092,8 @@ def _guild_scans(message: discord.Message, cfg: dict) -> bool:
         return False
     if message.channel.id == cfg.get("review_channel"):
         return False
+    if _is_reviewer(message.guild, message.author, cfg):
+        return False  # staff (can see the review channel) are exempt from moderation
     return True
 
 
@@ -1962,6 +1977,18 @@ async def post_cmd(
 
     cfg = state.guild(interaction.guild.id)
     raw = await image.read()
+
+    # Staff (anyone who can see the review channel) are exempt — post without scanning.
+    if _is_reviewer(interaction.guild, interaction.user, cfg):
+        body = f"{interaction.user.mention}:" + (f" {text}" if text else "")
+        await interaction.channel.send(
+            content=body,
+            file=discord.File(io.BytesIO(raw), filename=image.filename),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+        )
+        await interaction.followup.send("Posted (staff — not scanned).", ephemeral=True)
+        return
+
     verdict = await classify(
         raw, image.content_type or "image/png", cfg.get("sensitivity", "standard")
     )

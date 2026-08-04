@@ -176,11 +176,14 @@ Three buttons:
   scanning multiplies the per-GIF cost by up to `SENTRY_GIF_FRAMES`; lower it to trade
   coverage for cost. Embed/link scanning depends on the bot reaching the image URL and
   fails open (an unreachable link is not flagged).
-- Every member is scanned, including moderators and admins. Note that the
-  `Media Restricted` role cannot actually constrain a user with Administrator or
-  the server owner — Discord permissions override channel overwrites for them — so
-  their flagged images are still deleted and a case still opens, but no restriction
-  sticks.
+- **Staff are exempt.** Anyone who can **see the review channel** is treated as a
+  moderator and skipped entirely — their images are never scanned, removed, or sent to
+  Claude (this also covers `/post`). "Can see it" is computed from that member's real
+  permissions in the review channel, so it includes Administrators and the server owner
+  (who can view every channel). One consequence: **if the review channel is readable by
+  `@everyone`, everyone is exempt** and moderation effectively stops — keep it mod-only
+  (the `/sentry setup` command warns when it isn't). With no review channel set, nobody
+  is exempt.
 
 ## Tiers
 
