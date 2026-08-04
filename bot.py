@@ -424,7 +424,9 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
     if cached := _cache_get(cache_key):
         return cached
 
-    frames = _extract_frames(raw, mime)
+    # Pillow decode/resize/encode is CPU-heavy and synchronous; run it off the event
+    # loop so it can't stall the gateway or slash-command handling on a small VM.
+    frames = await asyncio.to_thread(_extract_frames, raw, mime)
     if not frames:
         # Fail open and don't cache: an undecodable/oversize file takes no action.
         return {
@@ -477,7 +479,7 @@ class Sentry(discord.Client):
             except Exception:
                 log.exception("could not resolve application owner")
         await start_admin_dashboard()
-        await self.tree.sync()
+        # Commands are synced per-guild in on_ready (instant; avoids global lag).
 
     async def close(self):
         await stop_admin_dashboard()
@@ -964,7 +966,7 @@ async def _sticker_attachment_payloads(
         if getattr(st.format, "name", "").lower() == "lottie":
             continue  # vector JSON, not a raster image
         raw = await _fetch_image_bytes(st.url)
-        if raw and _looks_like_image(raw):
+        if raw and await asyncio.to_thread(_looks_like_image, raw):
             payloads.append((f"sticker_{st.name}.img", "image/png", raw))
     return payloads
 
@@ -1005,13 +1007,34 @@ def _missing_perms(guild: discord.Guild) -> list[str]:
     return [label for attr, label in REQUIRED_PERMS.items() if not getattr(perms, attr)]
 
 
+_synced_once = False
+
+
+async def _sync_commands_to_guilds():
+    """Guild-sync so commands appear/update instantly (global sync can lag up to an
+    hour) and clear stale global copies to avoid duplicates."""
+    try:
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()  # push empty global set to remove stale global commands
+        log.info("commands guild-synced to %d guild(s)", len(bot.guilds))
+    except Exception:
+        log.exception("guild command sync failed")
+
+
 @bot.event
 async def on_ready():
+    global _synced_once
     log.info("connected as %s (%d guilds)", bot.user, len(bot.guilds))
     for guild in bot.guilds:
         missing = _missing_perms(guild)
         if missing:
             log.warning("guild '%s' missing permissions: %s", guild.name, ", ".join(missing))
+    if not _synced_once:
+        _synced_once = True
+        await _sync_commands_to_guilds()
 
 
 @bot.event
@@ -1021,6 +1044,11 @@ async def on_guild_join(guild: discord.Guild):
         log.warning("joined '%s' missing permissions: %s", guild.name, ", ".join(missing))
     else:
         log.info("joined '%s' with all required permissions", guild.name)
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+    except Exception:
+        log.exception("guild command sync on join failed for %s", guild.id)
 
 
 def _guild_scans(message: discord.Message, cfg: dict) -> bool:
@@ -1084,7 +1112,7 @@ async def _scan_embeds(message: discord.Message, cfg: dict):
     payloads: list[tuple[str, str, bytes]] = []
     for name, url in urls:
         raw = await _fetch_image_bytes(url)
-        if raw and _looks_like_image(raw):
+        if raw and await asyncio.to_thread(_looks_like_image, raw):
             payloads.append((name, "image/png", raw))
     await _run_moderation(message, payloads, cfg)
 
