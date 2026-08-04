@@ -38,6 +38,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
 | `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`); CSAM can't be disabled |
 | `/sentry dryrun` | Observe-only mode: report flags to the review channel, remove nothing (CSAM still removed) |
+| `/sentry allowlist` | **(bot owner only)** grant/revoke a server's premium access by ID |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |
@@ -160,6 +161,27 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   the server owner — Discord permissions override channel overwrites for them — so
   their flagged images are still deleted and a case still opens, but no restriction
   sticks.
+
+## Tiers
+
+Sentry is gated so only allowlisted ("premium") servers get the full feature set:
+
+- **Free** (default for any new server): only **`sexual_nudity`** and **`minor_sexual`** are
+  active, the server is locked to **watch-only** mode (flags are reported, nothing is
+  removed — except CSAM, always), and scanning is capped at **`SENTRY_FREE_SCAN_LIMIT`
+  (50) images per UTC day**.
+- **Premium** (allowlisted): every category, the ability to enforce (`/sentry dryrun off`),
+  and no scan cap.
+
+The allowlist is the bot owner's, managed via `SENTRY_ALLOWLIST` (comma-separated guild
+IDs), the `/sentry allowlist` command (owner-only), or the **admin dashboard**.
+
+**Admin dashboard.** Set `SENTRY_ADMIN_TOKEN` to enable a small web UI for managing the
+allowlist (list servers, grant/revoke premium, add by ID). It binds to `127.0.0.1:8899`
+by default, so reach it over an SSH tunnel — e.g.
+`gcloud compute ssh <vm> -- -L 8899:localhost:8899`, then open
+`http://localhost:8899/?token=YOUR_TOKEN`. Set `SENTRY_ADMIN_BIND=0.0.0.0:PORT` to expose
+it publicly (token-protected), but a tunnel is safer.
 
 ## Operational notes
 

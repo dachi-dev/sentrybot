@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -27,12 +28,14 @@ import os
 import re
 import time
 from collections import OrderedDict
+from html import escape as _esc
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 import anthropic
 import discord
+from aiohttp import web
 from anthropic import AsyncAnthropic
 from discord import app_commands
 
@@ -73,6 +76,22 @@ API_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
 # left up — so an outage or a weird file can't mass-delete content.
 CONFIDENCE_LEVELS = {"low": 0.60, "medium": 0.75, "high": 0.90}
 DEFAULT_MIN_CONFIDENCE = CONFIDENCE_LEVELS["medium"]
+
+# Feature gating (monetization). A non-allowlisted ("free") guild only gets the two
+# baseline categories and is locked to watch-only mode; allowlisting a guild
+# ("paying") unlocks every category and lets it enforce. The allowlist is the bot
+# owner's, managed via SENTRY_ALLOWLIST (comma-separated ids) or /sentry allowlist.
+ALL_CATEGORIES = {
+    "sexual_nudity", "gore", "minor_sexual", "hate_symbol", "violence_threat",
+    "harassment_doxxing", "self_harm", "drugs", "scam_spam",
+}
+FREE_CATEGORIES = {"minor_sexual", "sexual_nudity"}
+FREE_SCAN_LIMIT = int(os.getenv("SENTRY_FREE_SCAN_LIMIT", "50"))  # free scans per UTC day
+DEFAULT_DRY_RUN = True  # watch-only until a (premium) guild opts into enforcing
+ALLOWLIST_ENV = {
+    s.strip() for s in os.getenv("SENTRY_ALLOWLIST", "").split(",") if s.strip()
+}
+OWNER_ID = int(os.getenv("SENTRY_OWNER_ID", "0"))  # 0 => resolved from the app owner
 
 MAX_CONCURRENT_CHECKS = int(os.getenv("SENTRY_CONCURRENCY", "4"))
 VERDICT_CACHE_SIZE = 512
@@ -155,9 +174,30 @@ class State:
                 "approved_posts": {},  # sha256 -> [[channel_id, message_id]] reposts
                 "min_confidence": DEFAULT_MIN_CONFIDENCE,  # quarantine threshold
                 "disabled_categories": [],  # categories a mod turned off
-                "dry_run": False,  # report flags but take no action (except CSAM)
+                "dry_run": DEFAULT_DRY_RUN,  # watch-only until (premium) enforce opt-in
+                "scan_day": None,  # UTC date of the current free-tier quota window
+                "scan_count": 0,  # scans used in that window
+                "quota_notified": False,  # posted the "quota reached" notice yet
             },
         )
+
+    # --- premium allowlist (bot-owner controlled, stored under a reserved key) ---
+
+    def is_allowed(self, guild_id: int) -> bool:
+        s = str(guild_id)
+        return s in ALLOWLIST_ENV or s in self.data.get("__allowlist__", [])
+
+    def set_allowed(self, guild_id: int, on: bool) -> None:
+        lst = self.data.setdefault("__allowlist__", [])
+        s = str(guild_id)
+        if on and s not in lst:
+            lst.append(s)
+        elif not on and s in lst:
+            lst.remove(s)
+        self.save()
+
+    def allowlist(self) -> list[str]:
+        return list(self.data.get("__allowlist__", [])) + sorted(ALLOWLIST_ENV)
 
     def save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -427,9 +467,19 @@ class Sentry(discord.Client):
         self.add_view(UndoApprovalView())
         self.add_view(UpheldView())
         self.add_view(RestoredView())
+        global OWNER_ID
+        if not OWNER_ID:
+            try:
+                info = await self.application_info()
+                OWNER_ID = info.owner.id
+                log.info("resolved bot owner: %s", OWNER_ID)
+            except Exception:
+                log.exception("could not resolve application owner")
+        await start_admin_dashboard()
         await self.tree.sync()
 
     async def close(self):
+        await stop_admin_dashboard()
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -1038,6 +1088,27 @@ async def _scan_embeds(message: discord.Message, cfg: dict):
     await _run_moderation(message, payloads, cfg)
 
 
+def _premium(guild_id: int) -> bool:
+    """Whether a guild has paid/premium access (unlocks all categories + enforcing)."""
+    return state.is_allowed(guild_id)
+
+
+def _effective_disabled(guild_id: int, cfg: dict) -> set:
+    """Categories that won't act: the guild's own choices, plus — for a free guild —
+    every category except the two baseline (free) ones."""
+    disabled = set(cfg.get("disabled_categories", []))
+    if not _premium(guild_id):
+        disabled |= ALL_CATEGORIES - FREE_CATEGORIES
+    return disabled
+
+
+def _effective_dry(guild_id: int, cfg: dict) -> bool:
+    """Free guilds are always watch-only; premium guilds honor their dry_run setting."""
+    if not _premium(guild_id):
+        return True
+    return cfg.get("dry_run", DEFAULT_DRY_RUN)
+
+
 def _should_quarantine(verdict: dict, min_conf: float, disabled=()) -> bool:
     """Whether a verdict warrants removing the image: a failed check never acts,
     suspected CSAM always acts, a disabled category never acts, otherwise the
@@ -1146,6 +1217,27 @@ async def _log_dry_flag(message: discord.Message, flagged: list, cfg: dict):
         log.warning("cannot post dry-run notice to review channel")
 
 
+async def _log_quota_reached(message: discord.Message, cfg: dict):
+    """One-time notice when a free guild spends its daily scan quota."""
+    review_id = cfg.get("review_channel")
+    review = message.guild.get_channel(review_id) if review_id else None
+    if review is None:
+        return
+    embed = discord.Embed(
+        title="Free scan limit reached",
+        description=(
+            f"This server hit its free-tier limit of **{FREE_SCAN_LIMIT} scans/day**. "
+            "New images won't be scanned until the limit resets at midnight UTC — or "
+            "until the server is upgraded to remove the cap."
+        ),
+        colour=discord.Colour.orange(),
+    )
+    try:
+        await review.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        pass
+
+
 async def process(
     message: discord.Message, attachments: list[discord.Attachment], cfg: dict
 ):
@@ -1172,13 +1264,31 @@ async def _run_moderation(
     author = message.author
     channel = message.channel
     sensitivity = cfg.get("sensitivity", "standard")
+    premium = _premium(message.guild.id)
+
+    # Free tier: cap scans per UTC day. Reset the window on a new day, and stop
+    # scanning (once) when the quota is spent.
+    if not premium:
+        today = discord.utils.utcnow().date().isoformat()
+        if cfg.get("scan_day") != today:
+            cfg.update(scan_day=today, scan_count=0, quota_notified=False)
+            state.save()
+        if cfg.get("scan_count", 0) >= FREE_SCAN_LIMIT:
+            if not cfg.get("quota_notified"):
+                cfg["quota_notified"] = True
+                state.save()
+                await _log_quota_reached(message, cfg)
+            return False
 
     # A moderator's decisions are remembered so reposts never hit Claude again:
     # approved images pass untouched; disapproved ones re-block straight from cache.
     approved = set(cfg.get("approved_hashes", []))
     blocked = cfg.get("blocked_hashes", {})
 
+    fresh = 0  # images that actually hit Claude (count toward the free quota)
+
     async def verdict_for(mime: str, raw: bytes) -> dict:
+        nonlocal fresh
         digest = hashlib.sha256(raw).hexdigest()
         if digest in approved:
             return {
@@ -1197,11 +1307,16 @@ async def _run_moderation(
                 "reason": v.get("reason", "previously flagged"),
                 "error": False,
             }
+        fresh += 1
         return await classify(raw, mime, sensitivity)
 
     results = await asyncio.gather(
         *(verdict_for(mime, raw) for _, mime, raw in payloads)
     )
+
+    if not premium and fresh:
+        cfg["scan_count"] = cfg.get("scan_count", 0) + fresh
+        state.save()
 
     # Remember where an allow-listed image is (re)posted, so undoing its approval
     # can delete exactly those messages later — no history-scanning guesswork.
@@ -1220,7 +1335,7 @@ async def _run_moderation(
     # Quarantine a block only if it's confident enough, its category is enabled, and
     # it isn't a failed check (suspected CSAM always acts — see _should_quarantine).
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
-    disabled = set(cfg.get("disabled_categories", []))
+    disabled = _effective_disabled(message.guild.id, cfg)
     flagged = [
         (name, raw, v)
         for (name, _, raw), v in zip(payloads, results)
@@ -1252,9 +1367,9 @@ async def _run_moderation(
 
     critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
 
-    # Dry run: report to moderators but take no action — except suspected CSAM, which
-    # is always removed regardless.
-    if cfg.get("dry_run") and not critical:
+    # Dry run (incl. free-tier watch-only): report to moderators but take no action —
+    # except suspected CSAM, which is always removed regardless.
+    if _effective_dry(message.guild.id, cfg) and not critical:
         for name, raw, v in flagged:
             audit(
                 "dry_flag",
@@ -1516,6 +1631,17 @@ async def category_cmd(
     action: app_commands.Choice[str],
 ):
     cfg = state.guild(interaction.guild.id)
+    if (
+        action.value == "on"
+        and category.value not in FREE_CATEGORIES
+        and not _premium(interaction.guild.id)
+    ):
+        await interaction.response.send_message(
+            f"**{category.value}** is a premium category. This server can only use "
+            f"{', '.join(sorted(FREE_CATEGORIES))} — ask the bot owner to upgrade it.",
+            ephemeral=True,
+        )
+        return
     disabled = cfg.setdefault("disabled_categories", [])
     if action.value == "off":
         if category.value not in disabled:
@@ -1543,6 +1669,13 @@ async def dryrun_cmd(
     interaction: discord.Interaction, mode: app_commands.Choice[str]
 ):
     cfg = state.guild(interaction.guild.id)
+    if mode.value == "off" and not _premium(interaction.guild.id):
+        await interaction.response.send_message(
+            "Enforcement is a premium feature — this server is locked to watch-only "
+            "mode. Ask the bot owner to upgrade it to remove flagged images.",
+            ephemeral=True,
+        )
+        return
     cfg["dry_run"] = mode.value == "on"
     state.save()
     await interaction.response.send_message(
@@ -1550,6 +1683,39 @@ async def dryrun_cmd(
         "removed or restricted** (suspected CSAM is still removed)."
         if cfg["dry_run"]
         else "Dry run is **OFF** — flagged images are enforced normally.",
+        ephemeral=True,
+    )
+
+
+@mod.command(name="allowlist", description="(bot owner only) Grant/revoke a server's premium access")
+@app_commands.describe(guild_id="The server ID", action="Add or remove premium access")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="add — grant premium", value="add"),
+        app_commands.Choice(name="remove — revoke premium", value="remove"),
+    ]
+)
+async def allowlist_cmd(
+    interaction: discord.Interaction,
+    guild_id: str,
+    action: app_commands.Choice[str],
+):
+    if not OWNER_ID or interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            "Only the bot owner can manage the allowlist.", ephemeral=True
+        )
+        return
+    guild_id = guild_id.strip()
+    if not guild_id.isdigit():
+        await interaction.response.send_message(
+            "The server ID must be a number.", ephemeral=True
+        )
+        return
+    state.set_allowed(int(guild_id), action.value == "add")
+    audit("allowlist", actor=interaction.user.id, guild=int(guild_id), action=action.value)
+    await interaction.response.send_message(
+        f"Server `{guild_id}` **{'granted premium' if action.value == 'add' else 'reverted to free'}**. "
+        f"Currently allowlisted: {len(state.allowlist())}.",
         ephemeral=True,
     )
 
@@ -1622,12 +1788,23 @@ async def status_cmd(interaction: discord.Interaction):
     cfg = state.guild(interaction.guild.id)
     review = cfg["review_channel"]
     exempt = cfg["exempt_channels"]
+    premium = _premium(interaction.guild.id)
     embed = discord.Embed(title="Sentry status", colour=discord.Colour.blurple())
+    embed.add_field(
+        name="Tier",
+        value="✅ premium" if premium else f"free ({FREE_SCAN_LIMIT} scans/day, 2 categories)",
+    )
     embed.add_field(name="Scanning", value="on" if cfg["enabled"] else "off")
     embed.add_field(
         name="Mode",
-        value="🟡 dry run (no action)" if cfg.get("dry_run") else "enforcing",
+        value="🟡 dry run (no action)"
+        if _effective_dry(interaction.guild.id, cfg)
+        else "enforcing",
     )
+    if not premium:
+        today = discord.utils.utcnow().date().isoformat()
+        used = cfg.get("scan_count", 0) if cfg.get("scan_day") == today else 0
+        embed.add_field(name="Scans today", value=f"{used}/{FREE_SCAN_LIMIT}")
     embed.add_field(name="Sensitivity", value=cfg["sensitivity"])
     embed.add_field(name="Model", value=MODEL, inline=False)
     embed.add_field(
@@ -1699,7 +1876,7 @@ async def post_cmd(
     )
 
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
-    disabled = set(cfg.get("disabled_categories", []))
+    disabled = _effective_disabled(interaction.guild.id, cfg)
     if _should_quarantine(verdict, min_conf, disabled):
         restricted = await restrict(
             interaction.user, f"flagged via /post: {verdict.get('category')}"
@@ -1737,6 +1914,108 @@ async def post_cmd(
 
 
 bot.tree.add_command(mod)
+
+
+# --------------------------------------------------------------------------
+# Admin dashboard — a tiny web UI for the bot owner to manage the allowlist.
+# Disabled unless SENTRY_ADMIN_TOKEN is set. Binds to 127.0.0.1 by default so it's
+# only reachable over an SSH tunnel; set SENTRY_ADMIN_BIND=0.0.0.0:PORT to expose it.
+# --------------------------------------------------------------------------
+
+ADMIN_TOKEN = os.getenv("SENTRY_ADMIN_TOKEN", "")
+ADMIN_BIND = os.getenv("SENTRY_ADMIN_BIND", "127.0.0.1:8899")
+_admin_runner: "web.AppRunner | None" = None
+
+
+def _admin_authed(request: "web.Request") -> bool:
+    if not ADMIN_TOKEN:
+        return False
+    supplied = request.query.get("token") or request.headers.get("X-Admin-Token", "")
+    return hmac.compare_digest(supplied, ADMIN_TOKEN)
+
+
+def _admin_page(token: str) -> str:
+    in_guild = {g.id: g for g in bot.guilds}
+    rows = ""
+    for g in sorted(bot.guilds, key=lambda x: (x.name or "").lower()):
+        premium = state.is_allowed(g.id)
+        nxt = "remove" if premium else "add"
+        label = "Revoke" if premium else "Grant premium"
+        badge = "✅ premium" if premium else "free"
+        rows += (
+            f"<tr><td>{_esc(g.name)}</td><td><code>{g.id}</code></td>"
+            f"<td>{g.member_count or '?'}</td><td>{badge}</td>"
+            f"<td><form method=post action='/set?token={_esc(token)}'>"
+            f"<input type=hidden name=guild_id value='{g.id}'>"
+            f"<input type=hidden name=action value='{nxt}'>"
+            f"<button>{label}</button></form></td></tr>"
+        )
+    # allowlisted ids the bot isn't currently in
+    extra = ""
+    for gid in state.allowlist():
+        if int(gid) not in in_guild:
+            extra += (
+                f"<tr><td><em>not joined</em></td><td><code>{_esc(gid)}</code></td>"
+                f"<td>—</td><td>✅ premium</td>"
+                f"<td><form method=post action='/set?token={_esc(token)}'>"
+                f"<input type=hidden name=guild_id value='{_esc(gid)}'>"
+                f"<input type=hidden name=action value='remove'>"
+                f"<button>Revoke</button></form></td></tr>"
+            )
+    return f"""<!doctype html><meta charset=utf-8>
+<title>Sentry admin</title>
+<style>body{{font:15px system-ui;margin:2rem;max-width:820px}}
+table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:6px 10px;text-align:left}}
+button{{cursor:pointer}}code{{font-size:13px}}</style>
+<h2>Sentry — premium allowlist</h2>
+<p>Grant a server access to all categories + enforcement, or revoke it.</p>
+<table><tr><th>Server</th><th>ID</th><th>Members</th><th>Tier</th><th></th></tr>
+{rows}{extra}</table>
+<h3>Add a server by ID</h3>
+<form method=post action='/set?token={_esc(token)}'>
+<input name=guild_id placeholder='server id' required>
+<input type=hidden name=action value='add'>
+<button>Grant premium</button></form>"""
+
+
+async def _admin_index(request: "web.Request") -> "web.Response":
+    if not _admin_authed(request):
+        return web.Response(status=401, text="unauthorized")
+    return web.Response(
+        text=_admin_page(request.query.get("token", "")), content_type="text/html"
+    )
+
+
+async def _admin_set(request: "web.Request") -> "web.Response":
+    if not _admin_authed(request):
+        return web.Response(status=401, text="unauthorized")
+    data = await request.post()
+    gid = str(data.get("guild_id", "")).strip()
+    if gid.isdigit():
+        state.set_allowed(int(gid), data.get("action") == "add")
+    raise web.HTTPFound(f"/?token={request.query.get('token', '')}")
+
+
+async def start_admin_dashboard() -> None:
+    global _admin_runner
+    if not ADMIN_TOKEN:
+        log.info("admin dashboard disabled (set SENTRY_ADMIN_TOKEN to enable)")
+        return
+    app = web.Application()
+    app.router.add_get("/", _admin_index)
+    app.router.add_post("/set", _admin_set)
+    host, _, port = ADMIN_BIND.partition(":")
+    _admin_runner = web.AppRunner(app)
+    await _admin_runner.setup()
+    await web.TCPSite(_admin_runner, host or "127.0.0.1", int(port or 8899)).start()
+    log.info("admin dashboard listening on http://%s", ADMIN_BIND)
+
+
+async def stop_admin_dashboard() -> None:
+    global _admin_runner
+    if _admin_runner:
+        await _admin_runner.cleanup()
+        _admin_runner = None
 
 
 if __name__ == "__main__":

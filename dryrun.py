@@ -11,6 +11,7 @@ from types import SimpleNamespace
 os.environ.setdefault("DISCORD_TOKEN", "fake")
 os.environ.setdefault("ANTHROPIC_API_KEY", "fake")
 os.environ["SENTRY_STATE"] = "/tmp/dryrun_state.json"
+os.environ["SENTRY_ALLOWLIST"] = "1"  # guild 1 is premium; guild 2 stays free
 # Start each run from a clean slate so the persisted approve/block caches don't
 # leak between runs and make the scenarios non-deterministic.
 from pathlib import Path as _Path
@@ -91,8 +92,8 @@ class FakeMember:
 
 
 class FakeGuild:
-    def __init__(self):
-        self.id, self.name = 1, "Test Server"
+    def __init__(self, gid=1):
+        self.id, self.name = gid, "Test Server"
         self.review = FakeChannel(77, "mod-review")
         self._role = FakeRole()
 
@@ -134,6 +135,8 @@ async def scenario(label, verdict, attachments, *, raise_error=False):
     cfg["restricted_role"] = 999
     cfg["approved_hashes"] = []  # isolate scenarios from the persistent caches
     cfg["blocked_hashes"] = {}
+    cfg["disabled_categories"] = []
+    cfg["dry_run"] = False  # premium guild 1, enforcing
 
     msg = FakeMessage(guild, FakeChannel(10, "general"), attachments, "look at this")
     await sentry.process(msg, attachments, cfg)
@@ -338,6 +341,29 @@ async def main():
     print("\n=== dry run (gore flagged, no enforcement) ===")
     print(f"  message deleted (want No): {msg.deleted}")
     print(f"  review notice posted (want Yes): {notice}")
+
+    # free tier (guild 2, not allowlisted): premium category ignored, but CSAM still acts
+    free = FakeGuild(2)
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    NEXT_VERDICT.update(payload=gore)
+    NEXT_VERDICT["raise"] = False
+    cfg2 = sentry.state.guild(2)
+    cfg2["review_channel"] = 77
+    cfg2["restricted_role"] = 999
+    a = FakeAttachment("free_gore.png", (174, 24, 24))
+    m = FakeMessage(free, FakeChannel(10, "general"), [a], "gore on free tier")
+    await sentry.process(m, [a], cfg2)
+    print("\n=== free tier: premium category gore (guild 2) ===")
+    print(f"  message deleted (want No): {m.deleted}")
+
+    sentry.verdict_cache.clear()
+    NEXT_VERDICT.update(payload=csam)
+    a2 = FakeAttachment("free_csam.png", (33, 33, 33))
+    m2 = FakeMessage(free, FakeChannel(10, "general"), [a2], "csam on free tier")
+    await sentry.process(m2, [a2], cfg2)
+    print(f"  CSAM deleted even on free tier (want Yes): {m2.deleted}")
 
     # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
     _hp = sentry.HAS_PIL
