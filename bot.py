@@ -78,7 +78,7 @@ CONFIDENCE_LEVELS = {"low": 0.60, "medium": 0.75, "high": 0.90}
 DEFAULT_MIN_CONFIDENCE = CONFIDENCE_LEVELS["medium"]
 
 # Feature gating (monetization). A non-allowlisted ("free") guild watches every
-# category but is locked to watch-only mode (reports, removes nothing but CSAM) and
+# category but is locked to watch-only mode (reports, removes nothing) and
 # is capped per day; allowlisting a guild ("paying") lets it actually enforce. The
 # allowlist is the bot owner's, via SENTRY_ALLOWLIST (comma ids) or /sentry allowlist.
 FREE_SCAN_LIMIT = int(os.getenv("SENTRY_FREE_SCAN_LIMIT", "50"))  # free scans per UTC day
@@ -132,8 +132,7 @@ def audit(event: str, **fields: Any) -> None:
 
 # Optional local archive of blocked image bytes, for reviewing false positives. OFF
 # unless SENTRY_ARCHIVE_BLOCKED is a positive number of retention days. Files are named
-# by sha256 (matching the audit log), live next to the state file outside the git tree,
-# and suspected CSAM is NEVER written to disk.
+# by sha256 (matching the audit log) and live next to the state file outside the git tree.
 ARCHIVE_BLOCKED_DAYS = int(os.getenv("SENTRY_ARCHIVE_BLOCKED", "0"))
 ARCHIVE_DIR = STATE_PATH.parent / "blocked"
 
@@ -173,7 +172,7 @@ class State:
                 "scan_day": None,  # UTC date of the current free-tier quota window
                 "scan_count": 0,  # scans used in that window
                 "quota_notified": False,  # posted the "quota reached" notice yet
-                "alert_role": None,  # role pinged on every removal (owner DM stays CSAM-only)
+                "alert_role": None,  # role pinged on every removal
             },
         )
 
@@ -229,8 +228,6 @@ server. Categories:
 sexually explicit posing or content clearly intended to arouse.
 - "gore": graphic injury, mutilation, visible internal anatomy, significant \
 blood from real trauma, corpses, animal cruelty, real-world death.
-- "minor_sexual": any sexualized depiction of a person who appears to be a minor. \
-This overrides every other category.
 - "hate_symbol": Nazi, SS, KKK, or other recognized white-supremacist, extremist, \
 or terrorist symbols, flags, or salutes; hateful slurs rendered in the image; \
 dehumanizing hateful caricatures of a protected group.
@@ -276,7 +273,7 @@ Sensitivity level "{sensitivity}":
 and borderline cases in the other categories.
 
 Respond with exactly this JSON shape and nothing else:
-{{"verdict": "allow" | "block", "category": "clean" | "sexual_nudity" | "gore" | "minor_sexual" | "hate_symbol" | "violence_threat" | "harassment_doxxing" | "self_harm" | "drugs" | "scam_spam", "confidence": 0.0-1.0, "reason": "<max 12 words, non-graphic>"}}"""
+{{"verdict": "allow" | "block", "category": "clean" | "sexual_nudity" | "gore" | "hate_symbol" | "violence_threat" | "harassment_doxxing" | "self_harm" | "drugs" | "scam_spam", "confidence": 0.0-1.0, "reason": "<max 12 words, non-graphic>"}}"""
 
 
 def _cache_get(key: str) -> dict | None:
@@ -1138,13 +1135,11 @@ def _effective_dry(guild_id: int, cfg: dict) -> bool:
 
 def _should_quarantine(verdict: dict, min_conf: float, disabled=()) -> bool:
     """Whether a verdict warrants removing the image: a failed check never acts,
-    suspected CSAM always acts, a disabled category never acts, otherwise the
-    confidence must clear the threshold."""
+    a disabled category never acts, otherwise the confidence must clear the
+    threshold."""
     if verdict.get("verdict") != "block" or verdict.get("error"):
         return False
     category = verdict.get("category")
-    if category == "minor_sexual":
-        return True  # CSAM cannot be disabled
     if category in disabled:
         return False  # moderator turned this category off
     try:
@@ -1154,10 +1149,10 @@ def _should_quarantine(verdict: dict, min_conf: float, disabled=()) -> bool:
     return confidence >= min_conf
 
 
-def _archive_blocked(flagged: list, critical: bool) -> None:
+def _archive_blocked(flagged: list) -> None:
     """Optionally save blocked image bytes to ARCHIVE_DIR for later review. No-op
-    unless SENTRY_ARCHIVE_BLOCKED>0. NEVER writes suspected CSAM to disk. Never raises."""
-    if ARCHIVE_BLOCKED_DAYS <= 0 or critical:
+    unless SENTRY_ARCHIVE_BLOCKED>0. Never raises."""
+    if ARCHIVE_BLOCKED_DAYS <= 0:
         return
     try:
         ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1169,8 +1164,6 @@ def _archive_blocked(flagged: list, critical: bool) -> None:
             except OSError:
                 pass
         for _, raw, v in flagged:
-            if v.get("category") == "minor_sexual":
-                continue  # never write CSAM to disk
             ext = (_sniff_mime(raw) or "image/bin").split("/")[1]
             (ARCHIVE_DIR / f"{hashlib.sha256(raw).hexdigest()}.{ext}").write_bytes(raw)
     except Exception:
@@ -1254,7 +1247,7 @@ def _tier_note(guild_id: int) -> str:
         )
     return (
         f"**Free tier** — watch-only: everything is detected and reported here, but "
-        f"**nothing is removed** (except CSAM), capped at {FREE_SCAN_LIMIT} scans/day.\n"
+        f"**nothing is removed**, capped at {FREE_SCAN_LIMIT} scans/day.\n"
         "**Premium** actually removes flagged images and lifts the scan cap. DM "
         "**zukothedog** on Discord to upgrade."
     )
@@ -1404,7 +1397,7 @@ async def _run_moderation(
         state.save()
 
     # Quarantine a block only if it's confident enough, its category is enabled, and
-    # it isn't a failed check (suspected CSAM always acts — see _should_quarantine).
+    # it isn't a failed check.
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
     disabled = _effective_disabled(message.guild.id, cfg)
     flagged = [
@@ -1436,11 +1429,8 @@ async def _run_moderation(
                 )
         return False  # clean, below the confidence threshold, or a failed check
 
-    critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
-
-    # Dry run (incl. free-tier watch-only): report to moderators but take no action —
-    # except suspected CSAM, which is always removed regardless.
-    if _effective_dry(message.guild.id, cfg) and not critical:
+    # Dry run (incl. free-tier watch-only): report to moderators but take no action.
+    if _effective_dry(message.guild.id, cfg):
         for name, raw, v in flagged:
             audit(
                 "dry_flag",
@@ -1469,7 +1459,7 @@ async def _run_moderation(
 
     worst = max(flagged, key=lambda f: f[2].get("confidence", 0))[2]
     restricted = await restrict(author, f"flagged: {worst.get('category')}")
-    _archive_blocked(flagged, critical)
+    _archive_blocked(flagged)
 
     for name, raw, v in flagged:
         audit(
@@ -1500,9 +1490,8 @@ async def _run_moderation(
     except discord.Forbidden:
         pass
 
-    await open_case(message, flagged, worst, restricted, critical)
-    if not critical:  # never advertise right after removing suspected CSAM
-        await _post_ad(channel)
+    await open_case(message, flagged, worst, restricted)
+    await _post_ad(channel)
     return True
 
 
@@ -1511,7 +1500,6 @@ async def open_case(
     flagged: list,
     worst: dict,
     restricted: bool,
-    critical: bool,
 ):
     cfg = state.guild(message.guild.id)
     review_id = cfg.get("review_channel")
@@ -1523,8 +1511,8 @@ async def open_case(
         return
 
     embed = discord.Embed(
-        title="Image removed" + (" — CRITICAL" if critical else ""),
-        colour=discord.Colour.red() if not critical else discord.Colour.dark_purple(),
+        title="Image removed",
+        colour=discord.Colour.red(),
         timestamp=discord.utils.utcnow(),
     )
     embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)")
@@ -1569,73 +1557,37 @@ async def open_case(
     if changed:
         state.save()
 
-    files = []
-    if critical:
-        # Never re-upload suspected CSAM. Escalate without redistributing.
-        embed.description = (
-            "**The image was not attached to this case.** Suspected sexual content "
-            "involving a minor. Do not attempt to retrieve it. Report the user to "
-            "Discord Trust & Safety immediately: <https://dis.gd/report>. In the US, "
-            "reports also go to NCMEC CyberTipline: <https://report.cybertip.org>."
-        )
-    else:
-        # Fingerprint the attached images so an approval can be undone later without
-        # the bot needing to keep the image around after the case is resolved.
-        fps = [hashlib.sha256(raw).hexdigest() for _, raw, _ in flagged[:5]]
-        embed.add_field(name="Fingerprint", value=" ".join(fps), inline=False)
-        embed.set_footer(
-            text="Attachments are spoilered and removed once the case is resolved."
-        )
-        for name, raw, _ in flagged[:5]:
-            files.append(discord.File(io.BytesIO(raw), filename=f"SPOILER_{name}"))
+    # Fingerprint the attached images so an approval can be undone later without
+    # the bot needing to keep the image around after the case is resolved.
+    fps = [hashlib.sha256(raw).hexdigest() for _, raw, _ in flagged[:5]]
+    embed.add_field(name="Fingerprint", value=" ".join(fps), inline=False)
+    embed.set_footer(
+        text="Attachments are spoilered and removed once the case is resolved."
+    )
+    files = [
+        discord.File(io.BytesIO(raw), filename=f"SPOILER_{name}")
+        for name, raw, _ in flagged[:5]
+    ]
 
     content = None
     mentions = discord.AllowedMentions.none()
     alert_role = cfg.get("alert_role")
     if alert_role:
-        content = (
-            f"<@&{alert_role}> — **critical case, review immediately.**"
-            if critical
-            else f"<@&{alert_role}> — flagged content removed."
-        )
+        content = f"<@&{alert_role}> — flagged content removed."
         mentions = discord.AllowedMentions(
             everyone=False, users=False, roles=[discord.Object(id=alert_role)]
         )
     try:
-        sent = await review.send(
+        await review.send(
             content=content,
             embed=embed,
             files=files,
-            view=None if critical else ReviewView(),
+            view=ReviewView(),
             allowed_mentions=mentions,
         )
     except discord.Forbidden:
         log.warning("cannot post to review channel")
         return
-    if critical:
-        await _alert_owner(message.guild, sent)
-
-
-async def _alert_owner(guild: discord.Guild, case_message: discord.Message):
-    """DM the server owner about a critical (CSAM) case with a link to it. Best-effort."""
-    owner = guild.owner
-    if owner is None and guild.owner_id:
-        try:
-            owner = await guild.fetch_member(guild.owner_id)
-        except discord.HTTPException:
-            owner = None
-    if owner is None:
-        return
-    try:
-        await owner.send(
-            f"⚠️ **Critical case in {guild.name}** — suspected sexual content involving a "
-            f"minor was detected and removed. Review it here: {case_message.jump_url}\n"
-            "Report the account to Discord Trust & Safety (<https://dis.gd/report>); in the "
-            "US you may also report to the NCMEC CyberTipline (<https://report.cybertip.org>). "
-            "The image was not stored anywhere."
-        )
-    except discord.Forbidden:
-        pass
 
 
 # --------------------------------------------------------------------------
@@ -1715,8 +1667,7 @@ async def threshold_cmd(
     state.save()
     await interaction.response.send_message(
         f"Quarantine threshold set to **{level.value}** "
-        f"(confidence ≥ {CONFIDENCE_LEVELS[level.value]:.2f}). "
-        f"Suspected CSAM is always removed regardless.",
+        f"(confidence ≥ {CONFIDENCE_LEVELS[level.value]:.2f}).",
         ephemeral=True,
     )
 
@@ -1760,7 +1711,7 @@ async def category_cmd(
 
 @mod.command(
     name="alertrole",
-    description="Role to ping on every removal; the owner is also DM'd on critical (CSAM) cases",
+    description="Role to ping whenever content is removed",
 )
 @app_commands.describe(role="Role to ping whenever content is removed; leave empty to clear")
 async def alertrole_cmd(
@@ -1770,9 +1721,9 @@ async def alertrole_cmd(
     cfg["alert_role"] = role.id if role else None
     state.save()
     await interaction.response.send_message(
-        f"{role.mention} will be pinged on every removal. The owner is also DM'd on critical (CSAM) cases."
+        f"{role.mention} will be pinged on every removal."
         if role
-        else "Alert role cleared. The server owner is still DM'd on critical (CSAM) cases.",
+        else "Alert role cleared.",
         ephemeral=True,
     )
 
@@ -1802,7 +1753,7 @@ async def dryrun_cmd(
     state.save()
     await interaction.response.send_message(
         "Dry run is **ON** — flags are reported to the review channel but **nothing is "
-        "removed or restricted** (suspected CSAM is still removed)."
+        "removed or restricted**."
         if cfg["dry_run"]
         else "Dry run is **OFF** — flagged images are enforced normally.",
         ephemeral=True,
@@ -2024,7 +1975,6 @@ async def post_cmd(
             [(image.filename, raw, verdict)],
             verdict,
             restricted,
-            verdict.get("category") == "minor_sexual",
         )
         return
 

@@ -36,9 +36,9 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry setup` | Choose the review channel (warns if @everyone can read it) |
 | `/sentry sensitivity` | `relaxed` / `standard` / `strict` (what Claude flags) |
 | `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
-| `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`); CSAM can't be disabled |
-| `/sentry dryrun` | Observe-only mode: report flags to the review channel, remove nothing (CSAM still removed) |
-| `/sentry alertrole` | Role to ping on **every removal**; the server owner is also DM'd on critical (CSAM) cases |
+| `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`) |
+| `/sentry dryrun` | Observe-only mode: report flags to the review channel, remove nothing |
+| `/sentry alertrole` | Role to ping on **every removal** |
 | `/sentry allowlist` | **(bot owner only)** grant/revoke a server's premium access by ID |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
@@ -79,8 +79,8 @@ user's message. The case embed shows how many files tripped it.
 
 ## Categories
 
-Every category except `minor_sexual` can be turned on/off per server with
-`/sentry category` and is subject to the confidence threshold.
+Every category can be turned on/off per server with `/sentry category` and is
+subject to the confidence threshold.
 
 | Category | Configurable | Flags |
 |---|---|---|
@@ -92,26 +92,13 @@ Every category except `minor_sexual` can be turned on/off per server with
 | `self_harm` | yes | depicting/promoting suicide or self-harm |
 | `drugs` | yes | hard/illegal drug use, sale, promotion |
 | `scam_spam` | yes | phishing, crypto/giveaway scams, mass ads |
-| `minor_sexual` | **no — always on** | A non-configurable **safety net**, not a marketed feature. It can't be disabled, set to watch-only, or tuned by threshold. **Primary detection of this content is Discord's responsibility, not this bot's** — Sentry only acts as a last-line backstop for what reaches a channel. See the CSAM policy below. |
 
-## CSAM policy
+## Child sexual abuse material (CSAM)
 
-Suspected sexual content involving a minor (`minor_sexual`) is treated as a safety
-backstop, not a feature:
-
-- **Primary detection is deferred to Discord.** Discord runs platform-level detection and
-  reporting for this content (including to NCMEC); Sentry is only a secondary backstop for
-  what still reaches a channel.
-- **The bot never stores or redistributes it.** It is removed on sight, never re-uploaded
-  to the review channel, never written to the blocked-image archive, and never posted
-  anywhere. Only a **SHA-256 fingerprint and short non-graphic metadata** are retained (to
-  re-block reposts) — never the image bytes.
-- **A human is alerted immediately** — the server owner is DM'd a link to the case, and an
-  optional alert role (`/sentry alertrole`) is pinged in the review channel.
-- **Moderators/operators must report the account to Discord** (Trust & Safety,
-  <https://dis.gd/report>), who handle NCMEC reporting; in the US you may also report
-  directly to the NCMEC CyberTipline (<https://report.cybertip.org>). Do not attempt to
-  retrieve or forward the content.
+Sentry does **not** classify or handle CSAM. Detection and reporting of this content
+is **entirely Discord's responsibility** — Discord runs platform-level detection on
+every upload and reports to NCMEC as legally required, independent of this bot. Sentry
+has no CSAM category and takes no CSAM-specific action.
 
 ## Restriction mechanic
 
@@ -156,10 +143,6 @@ Three buttons:
   IDs are tracked in state, so cleanup is exact, not a history scan. No one re-handles the
   image.
 
-**Exception:** if Claude classifies something as sexual content involving a minor, the
-image is **not** re-uploaded to the review channel. The case carries metadata only, plus
-reporting links (Discord T&S, NCMEC). Report the account; do not forward the content.
-
 ## Tuning
 
 - **False positives** are the main failure mode, and they now cost a real deletion. The
@@ -178,9 +161,9 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   errors (429/5xx/timeouts) are retried with backoff before giving up.
 - **Confidence threshold** (`/sentry threshold`) sets how sure Claude must be before an
   image is quarantined: `low` (≥0.60), `medium` (≥0.75, default), `high` (≥0.90). Raise it
-  if you see false positives; lower it to catch more borderline cases. Suspected CSAM is
-  always removed regardless of the threshold. This is separate from **sensitivity**, which
-  changes *what* Claude flags; the threshold filters *how confident* a flag must be.
+  if you see false positives; lower it to catch more borderline cases. This is separate
+  from **sensitivity**, which changes *what* Claude flags; the threshold filters *how
+  confident* a flag must be.
 - **Cost:** one Haiku call per image at ~800 input tokens, ~50 output. Identical
   re-uploads cost nothing: an in-memory cache covers the current session, and moderator
   decisions (both approvals and disapprovals) **persist to `sentry_state.json`**, so a
@@ -204,9 +187,9 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
 Sentry is gated so only allowlisted ("premium") servers get the full feature set:
 
 - **Free** (default for any new server): **watches every category** and reports flags to
-  the review channel, but is locked to **watch-only** — nothing is removed (except CSAM,
-  always) — capped at **`SENTRY_FREE_SCAN_LIMIT` (50)** scans per UTC day, and a "powered
-  by" ad is posted publicly on each detection.
+  the review channel, but is locked to **watch-only** — nothing is removed — capped at
+  **`SENTRY_FREE_SCAN_LIMIT` (50)** scans per UTC day, and a "powered by" ad is posted
+  publicly on each detection.
 - **Premium** (allowlisted): actually **removes** flagged images (`/sentry dryrun off`) and
   has no scan cap.
 
@@ -232,8 +215,8 @@ it publicly (token-protected), but a tunnel is safer.
   cases become inaccessible. Read it with e.g. `jq . audit.jsonl`.
 - **Blocked-image archive (opt-in).** Set `SENTRY_ARCHIVE_BLOCKED=N` to save each blocked
   image's bytes to `blocked/<sha256>.<ext>` (next to the state file) for `N` days, so you
-  can eyeball false positives directly. Off by default, and **suspected CSAM is never
-  written to disk**. The filename's sha256 matches the audit log, so you can cross-ref.
+  can eyeball false positives directly. Off by default. The filename's sha256 matches the
+  audit log, so you can cross-ref.
 - Review buttons are persistent — they keep working after a restart.
 - One process, asyncio semaphore capping concurrent API calls at 4. An image-spam raid
   queues rather than fanning out, which lengthens the visibility window under load.

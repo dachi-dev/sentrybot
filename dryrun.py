@@ -169,11 +169,11 @@ async def main():
         "confidence": 0.93,
         "reason": "graphic real injury",
     }
-    csam = {
+    nudity = {
         "verdict": "block",
-        "category": "minor_sexual",
-        "confidence": 0.88,
-        "reason": "policy violation",
+        "category": "sexual_nudity",
+        "confidence": 0.91,
+        "reason": "explicit nudity",
     }
     hate = {
         "verdict": "block",
@@ -190,14 +190,15 @@ async def main():
         gore,
         [FakeAttachment("a.png", (10, 10, 200)), FakeAttachment("b.png", (200, 10, 10))],
     )
-    await scenario("critical category", csam, [FakeAttachment("x.png", (30, 30, 30))])
+    await scenario("sexual nudity flagged (normal flow, preview attached)", nudity,
+                   [FakeAttachment("x.png", (200, 150, 140))])
     await scenario(
         "API outage → no action + mod-channel notice", clean,
         [FakeAttachment("y.png", (80, 80, 80))], raise_error=True,
     )
 
-    # alert role pings on EVERY removal, not just CSAM
-    for label, verdict in (("non-CSAM (gore)", gore), ("critical (CSAM)", csam)):
+    # alert role pings on EVERY removal
+    for label, verdict in (("gore", gore), ("sexual nudity", nudity)):
         EVENTS.clear(); CALLS.clear(); sentry.verdict_cache.clear()
         NEXT_VERDICT.clear(); NEXT_VERDICT.update(payload=verdict); NEXT_VERDICT["raise"] = False
         guild = FakeGuild()
@@ -216,10 +217,13 @@ async def main():
             e[0] == "review_post" and "555" in str(e[1].get("content") or "")
             for e in EVENTS
         )
-        owner_dm = any(e[0] == "dm" and "Critical" in str(e[1]) for e in EVENTS)
+        preview = any(
+            e[0] == "review_post" and (e[1].get("files") or [])
+            for e in EVENTS
+        )
         print(f"\n=== alert role on a {label} removal ===")
-        print(f"  role pinged (want Yes): {pinged}")
-        print(f"  owner DM'd (want {'Yes' if verdict is csam else 'No'}): {owner_dm}")
+        print(f"  role pinged (want Yes)   : {pinged}")
+        print(f"  preview attached (want Yes): {preview}")
     cfg["alert_role"] = None
 
     # cache: same bytes twice should cost one call
@@ -376,7 +380,7 @@ async def main():
     print(f"  message deleted (want No): {msg.deleted}")
     print(f"  review notice posted (want Yes): {notice}")
 
-    # free tier (guild 2, not allowlisted): premium category ignored, but CSAM still acts
+    # free tier (guild 2, not allowlisted): every category is watch-only, nothing removed
     free = FakeGuild(2)
     EVENTS.clear()
     CALLS.clear()
@@ -395,11 +399,11 @@ async def main():
     print(f"  mod-chan notice posted (want Yes): {notice}")
 
     sentry.verdict_cache.clear()
-    NEXT_VERDICT.update(payload=csam)
-    a2 = FakeAttachment("free_csam.png", (33, 33, 33))
-    m2 = FakeMessage(free, FakeChannel(10, "general"), [a2], "csam on free tier")
+    NEXT_VERDICT.update(payload=nudity)
+    a2 = FakeAttachment("free_nudity.png", (200, 150, 140))
+    m2 = FakeMessage(free, FakeChannel(10, "general"), [a2], "nudity on free tier")
     await sentry.process(m2, [a2], cfg2)
-    print(f"  CSAM deleted even on free tier (want Yes): {m2.deleted}")
+    print(f"  sexual nudity is watch-only on free tier (want No): {m2.deleted}")
 
     # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
     _hp = sentry.HAS_PIL
