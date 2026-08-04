@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import logging
+import logging.handlers
 import os
 import re
 from collections import OrderedDict
@@ -82,6 +83,36 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
 log = logging.getLogger("sentry")
+
+
+# Persistent, rotating audit log (one JSON object per line). It lives next to the
+# state file — outside the git tree — so a full record of every removal, check
+# failure, and moderator action survives the bot being kicked from a server,
+# restarts, and redeploys. Override the path with SENTRY_AUDIT_LOG.
+AUDIT_LOG_PATH = Path(
+    os.getenv("SENTRY_AUDIT_LOG", str(STATE_PATH.parent / "audit.jsonl"))
+)
+audit_log = logging.getLogger("sentry.audit")
+audit_log.setLevel(logging.INFO)
+audit_log.propagate = False
+try:
+    AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _audit_handler = logging.handlers.RotatingFileHandler(
+        AUDIT_LOG_PATH, maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+    )
+    _audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    audit_log.addHandler(_audit_handler)
+except Exception:
+    log.exception("could not open audit log at %s", AUDIT_LOG_PATH)
+
+
+def audit(event: str, **fields: Any) -> None:
+    """Append one JSON line to the persistent audit log. Never raises."""
+    try:
+        record = {"ts": discord.utils.utcnow().isoformat(), "event": event, **fields}
+        audit_log.info(json.dumps(record, default=str))
+    except Exception:
+        log.exception("audit logging failed")
 
 
 # --------------------------------------------------------------------------
@@ -540,6 +571,15 @@ class ReviewView(discord.ui.View):
             approved.extend(h for h in hashes if h not in approved)
             state.save()
 
+        audit(
+            "mod_action",
+            action="approve",
+            actor=interaction.user.id,
+            case_user=member.id,
+            guild=interaction.guild.id,
+            hashes=hashes,
+        )
+
         try:
             await member.send(
                 f"Good news — a moderator in **{interaction.guild.name}** approved your "
@@ -654,6 +694,13 @@ async def _flip_restriction(
         )
         colour, next_view = discord.Colour.dark_red(), UpheldView()
 
+    audit(
+        "mod_action",
+        action="restore" if restore else "restrict",
+        actor=interaction.user.id,
+        case_user=member.id,
+        guild=interaction.guild.id,
+    )
     embed = interaction.message.embeds[0]
     embed.colour = colour
     embed.add_field(
@@ -713,6 +760,15 @@ class UndoApprovalView(discord.ui.View):
                 except discord.HTTPException:
                     pass
         state.save()
+
+        audit(
+            "mod_action",
+            action="undo_approval",
+            actor=interaction.user.id,
+            guild=interaction.guild.id,
+            hashes=list(hashes),
+            reposts_deleted=deleted,
+        )
 
         embed = interaction.message.embeds[0]
         embed.colour = discord.Colour.orange()
@@ -1103,6 +1159,18 @@ async def _run_moderation(
         ]
         if errored:
             await _log_check_failure(message, errored, cfg)
+            for name, raw, v in errored:
+                audit(
+                    "check_failed",
+                    guild=message.guild.id,
+                    channel=channel.id,
+                    user=author.id,
+                    message=message.id,
+                    source=name,
+                    category=v.get("category"),
+                    reason=v.get("reason"),
+                    sha256=hashlib.sha256(raw).hexdigest(),
+                )
         return False  # clean, below the confidence threshold, or a failed check
 
     # A message is atomic — one bad item takes the whole message with it.
@@ -1116,6 +1184,21 @@ async def _run_moderation(
     worst = max(flagged, key=lambda f: f[2].get("confidence", 0))[2]
     critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
     restricted = await restrict(author, f"flagged: {worst.get('category')}")
+
+    for name, raw, v in flagged:
+        audit(
+            "removed",
+            guild=message.guild.id,
+            channel=channel.id,
+            user=author.id,
+            message=message.id,
+            source=name,
+            category=v.get("category"),
+            confidence=v.get("confidence"),
+            reason=v.get("reason"),
+            restricted=restricted,
+            sha256=hashlib.sha256(raw).hexdigest(),
+        )
 
     try:
         await author.send(

@@ -163,6 +163,12 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
 
 - State lives in `sentry_state.json`. Back it up; both values are recoverable by
   re-running `/sentry setup`.
+- **Audit log.** Every removal, check-failure, and moderator action is appended as one
+  JSON object per line to `audit.jsonl` (next to the state file; override with
+  `SENTRY_AUDIT_LOG`, rotated at 5 MB × 5). It records the user, channel, message id,
+  category, confidence, reason, and SHA-256 — so you can reconstruct exactly what
+  happened and why **even if the bot is kicked from the server** and the Discord-side
+  cases become inaccessible. Read it with e.g. `jq . audit.jsonl`.
 - Review buttons are persistent — they keep working after a restart.
 - One process, asyncio semaphore capping concurrent API calls at 4. An image-spam raid
   queues rather than fanning out, which lengthens the visibility window under load.
