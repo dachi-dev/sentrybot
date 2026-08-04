@@ -460,7 +460,7 @@ class Sentry(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True  # required to see attachments
         intents.guilds = True
-        super().__init__(intents=intents, enable_debug_events=True)
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.http_session: aiohttp.ClientSession | None = None
 
@@ -1022,26 +1022,6 @@ async def _sync_commands_to_guilds():
         log.info("commands guild-synced to %d guild(s)", len(bot.guilds))
     except Exception:
         log.exception("command sync failed")
-
-
-@bot.event
-async def on_socket_raw_receive(msg):
-    try:
-        if isinstance(msg, str):
-            data = json.loads(msg)
-            if data.get("op") == 0:  # a dispatched gateway event
-                log.info("DIAG socket event: %s", data.get("t"))
-    except Exception:
-        pass
-
-
-@bot.event
-async def on_interaction(interaction: discord.Interaction):
-    name = (interaction.data or {}).get("name") if interaction.data else None
-    log.info(
-        "DIAG interaction dispatched: type=%s name=%s guild=%s user=%s",
-        interaction.type, name, interaction.guild_id, interaction.user.id,
-    )
 
 
 @bot.event
