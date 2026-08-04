@@ -155,6 +155,27 @@ ARCHIVE_DIR = STATE_PATH.parent / "blocked"
 # State
 # --------------------------------------------------------------------------
 
+# Per-guild defaults. Mutable defaults are factories (list/dict) so every guild
+# gets its own instance. Backfilled into existing guilds on access, so a guild
+# stored before a field was added still picks up that field's default.
+_GUILD_DEFAULTS: dict[str, Any] = {
+    "review_channel": None,
+    "restricted_role": None,
+    "enabled": True,
+    "sensitivity": "standard",  # relaxed | standard | strict
+    "exempt_channels": list,
+    "approved_hashes": list,  # sha256s a mod approved; never re-flagged
+    "blocked_hashes": dict,  # sha256 -> verdict; reposts skip Claude
+    "approved_posts": dict,  # sha256 -> [[channel_id, message_id]] reposts
+    "min_confidence": DEFAULT_MIN_CONFIDENCE,  # quarantine threshold
+    "disabled_categories": list,  # categories a mod turned off
+    "dry_run": DEFAULT_DRY_RUN,  # watch-only until (premium) enforce opt-in
+    "scan_day": None,  # UTC date of the current daily scan window
+    "scan_count": 0,  # scans used in that window
+    "quota_notified": False,  # posted the "quota reached" notice yet
+    "alert_role": None,  # role pinged on every removal
+}
+
 
 class State:
     """Tiny JSON-backed per-guild config store."""
@@ -169,26 +190,13 @@ class State:
                 log.exception("state file unreadable, starting fresh")
 
     def guild(self, guild_id: int) -> dict[str, Any]:
-        return self.data.setdefault(
-            str(guild_id),
-            {
-                "review_channel": None,
-                "restricted_role": None,
-                "enabled": True,
-                "sensitivity": "standard",  # relaxed | standard | strict
-                "exempt_channels": [],
-                "approved_hashes": [],  # sha256s a mod approved; never re-flagged
-                "blocked_hashes": {},  # sha256 -> verdict; reposts skip Claude
-                "approved_posts": {},  # sha256 -> [[channel_id, message_id]] reposts
-                "min_confidence": DEFAULT_MIN_CONFIDENCE,  # quarantine threshold
-                "disabled_categories": [],  # categories a mod turned off
-                "dry_run": DEFAULT_DRY_RUN,  # watch-only until (premium) enforce opt-in
-                "scan_day": None,  # UTC date of the current free-tier quota window
-                "scan_count": 0,  # scans used in that window
-                "quota_notified": False,  # posted the "quota reached" notice yet
-                "alert_role": None,  # role pinged on every removal
-            },
-        )
+        cfg = self.data.setdefault(str(guild_id), {})
+        # Backfill missing keys so guilds created before a field existed still
+        # get its default — setdefault on the whole dict only helps new guilds.
+        for key, default in _GUILD_DEFAULTS.items():
+            if key not in cfg:
+                cfg[key] = default() if callable(default) else default
+        return cfg
 
     # --- premium allowlist (bot-owner controlled, stored under a reserved key) ---
 
@@ -1346,24 +1354,26 @@ async def _run_moderation(
 
     # Free tier: cap scans per UTC day. Reset the window on a new day, and stop
     # scanning (once) when the quota is spent.
-    if not premium:
-        today = discord.utils.utcnow().date().isoformat()
-        if cfg.get("scan_day") != today:
-            cfg.update(scan_day=today, scan_count=0, quota_notified=False)
+    # Track daily scan volume for EVERY guild (drives the dashboard's activity
+    # metric); reset the window on a new UTC day. Free tier additionally enforces
+    # a hard cap — premium is uncapped but still counted.
+    today = discord.utils.utcnow().date().isoformat()
+    if cfg.get("scan_day") != today:
+        cfg.update(scan_day=today, scan_count=0, quota_notified=False)
+        state.save()
+    if not premium and cfg.get("scan_count", 0) >= FREE_SCAN_LIMIT:
+        if not cfg.get("quota_notified"):
+            cfg["quota_notified"] = True
             state.save()
-        if cfg.get("scan_count", 0) >= FREE_SCAN_LIMIT:
-            if not cfg.get("quota_notified"):
-                cfg["quota_notified"] = True
-                state.save()
-                await _log_quota_reached(message, cfg)
-            return False
+            await _log_quota_reached(message, cfg)
+        return False
 
     # A moderator's decisions are remembered so reposts never hit Claude again:
     # approved images pass untouched; disapproved ones re-block straight from cache.
     approved = set(cfg.get("approved_hashes", []))
     blocked = cfg.get("blocked_hashes", {})
 
-    fresh = 0  # images that actually hit Claude (count toward the free quota)
+    fresh = 0  # images that actually hit Claude (counted toward daily scan volume)
 
     async def verdict_for(mime: str, raw: bytes) -> dict:
         nonlocal fresh
@@ -1392,7 +1402,7 @@ async def _run_moderation(
         *(verdict_for(mime, raw) for _, mime, raw in payloads)
     )
 
-    if not premium and fresh:
+    if fresh:
         cfg["scan_count"] = cfg.get("scan_count", 0) + fresh
         state.save()
 
@@ -1881,10 +1891,11 @@ async def status_cmd(interaction: discord.Interaction):
         if _effective_dry(interaction.guild.id, cfg)
         else "enforcing",
     )
-    if not premium:
-        today = discord.utils.utcnow().date().isoformat()
-        used = cfg.get("scan_count", 0) if cfg.get("scan_day") == today else 0
-        embed.add_field(name="Scans today", value=f"{used}/{FREE_SCAN_LIMIT}")
+    today = discord.utils.utcnow().date().isoformat()
+    used = cfg.get("scan_count", 0) if cfg.get("scan_day") == today else 0
+    embed.add_field(
+        name="Scans today", value=f"{used}" if premium else f"{used}/{FREE_SCAN_LIMIT}"
+    )
     embed.add_field(name="Sensitivity", value=cfg["sensitivity"])
     embed.add_field(name="Model", value=MODEL, inline=False)
     embed.add_field(
@@ -2248,9 +2259,9 @@ def _guild_settings_page(token: str, gid: int) -> str:
 </fieldset>
 <button>Save settings</button>
 </form>
-<fieldset><legend>Free-tier quota</legend>
-<p><b>{used} / {FREE_SCAN_LIMIT}</b> scans used today (UTC).
-<span class=note>Premium servers are uncapped.</span></p>
+<fieldset><legend>Daily scans</legend>
+<p><b>{used}</b> scans today (UTC){'' if premium else f' / {FREE_SCAN_LIMIT} cap'}.
+<span class=note>{'Premium — uncapped.' if premium else 'Free tier stops at the cap.'}</span></p>
 <form method=post action='/guild/quota-reset?token={_esc(token)}'>
 <input type=hidden name=guild_id value='{gid}'>
 <button>Reset today's quota</button></form>

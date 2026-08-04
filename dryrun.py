@@ -404,6 +404,23 @@ async def main():
     m2 = FakeMessage(free, FakeChannel(10, "general"), [a2], "nudity on free tier")
     await sentry.process(m2, [a2], cfg2)
     print(f"  sexual nudity is watch-only on free tier (want No): {m2.deleted}")
+    print(f"  free-tier scan_count incremented (want 2): {cfg2.get('scan_count')}")
+
+    # daily scans are counted for PREMIUM guilds too (uncapped, for observability)
+    sentry.verdict_cache.clear()
+    prem = FakeGuild(1)  # guild 1 is allowlisted premium in this harness
+    cfgp = sentry.state.guild(1)
+    cfgp["scan_day"] = None
+    cfgp["scan_count"] = 0
+    cfgp["review_channel"] = 77
+    cfgp["approved_hashes"] = []
+    cfgp["blocked_hashes"] = {}
+    NEXT_VERDICT.update(payload=clean)
+    ap = FakeAttachment("prem.png", (90, 160, 90))
+    mp = FakeMessage(prem, FakeChannel(10, "general"), [ap], "clean on premium")
+    await sentry.process(mp, [ap], cfgp)
+    print("\n=== premium scans are counted (guild 1) ===")
+    print(f"  premium scan_count (want 1): {cfgp.get('scan_count')}")
 
     # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
     _hp = sentry.HAS_PIL
