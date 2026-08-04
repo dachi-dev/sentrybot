@@ -1026,8 +1026,13 @@ async def _sync_commands_to_guilds():
 
 @bot.event
 async def on_socket_raw_receive(msg):
-    if isinstance(msg, str) and '"INTERACTION_CREATE"' in msg:
-        log.info("DIAG raw INTERACTION_CREATE arrived on the gateway socket")
+    try:
+        if isinstance(msg, str):
+            data = json.loads(msg)
+            if data.get("op") == 0:  # a dispatched gateway event
+                log.info("DIAG socket event: %s", data.get("t"))
+    except Exception:
+        pass
 
 
 @bot.event
