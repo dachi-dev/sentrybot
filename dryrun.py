@@ -360,8 +360,10 @@ async def main():
     a = FakeAttachment("free_gore.png", (174, 24, 24))
     m = FakeMessage(free, FakeChannel(10, "general"), [a], "gore on free tier")
     await sentry.process(m, [a], cfg2)
-    print("\n=== free tier: premium category gore (guild 2) ===")
+    notice = any(e[0] == "review_post" for e in EVENTS)
+    print("\n=== free tier: gore is WATCHED (guild 2) ===")
     print(f"  message deleted (want No): {m.deleted}")
+    print(f"  mod-chan notice posted (want Yes): {notice}")
 
     sentry.verdict_cache.clear()
     NEXT_VERDICT.update(payload=csam)

@@ -166,12 +166,12 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
 
 Sentry is gated so only allowlisted ("premium") servers get the full feature set:
 
-- **Free** (default for any new server): only **`sexual_nudity`** and **`minor_sexual`** are
-  active, the server is locked to **watch-only** mode (flags are reported, nothing is
-  removed — except CSAM, always), and scanning is capped at **`SENTRY_FREE_SCAN_LIMIT`
-  (50) images per UTC day**.
-- **Premium** (allowlisted): every category, the ability to enforce (`/sentry dryrun off`),
-  and no scan cap.
+- **Free** (default for any new server): **watches every category** and reports flags to
+  the review channel, but is locked to **watch-only** — nothing is removed (except CSAM,
+  always) — capped at **`SENTRY_FREE_SCAN_LIMIT` (50)** scans per UTC day, and a "powered
+  by" ad is posted publicly on each detection.
+- **Premium** (allowlisted): actually **removes** flagged images (`/sentry dryrun off`) and
+  has no scan cap.
 
 The allowlist is the bot owner's, managed via `SENTRY_ALLOWLIST` (comma-separated guild
 IDs), the `/sentry allowlist` command (owner-only), or the **admin dashboard**.

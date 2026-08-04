@@ -77,15 +77,10 @@ API_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
 CONFIDENCE_LEVELS = {"low": 0.60, "medium": 0.75, "high": 0.90}
 DEFAULT_MIN_CONFIDENCE = CONFIDENCE_LEVELS["medium"]
 
-# Feature gating (monetization). A non-allowlisted ("free") guild only gets the two
-# baseline categories and is locked to watch-only mode; allowlisting a guild
-# ("paying") unlocks every category and lets it enforce. The allowlist is the bot
-# owner's, managed via SENTRY_ALLOWLIST (comma-separated ids) or /sentry allowlist.
-ALL_CATEGORIES = {
-    "sexual_nudity", "gore", "minor_sexual", "hate_symbol", "violence_threat",
-    "harassment_doxxing", "self_harm", "drugs", "scam_spam",
-}
-FREE_CATEGORIES = {"minor_sexual", "sexual_nudity"}
+# Feature gating (monetization). A non-allowlisted ("free") guild watches every
+# category but is locked to watch-only mode (reports, removes nothing but CSAM) and
+# is capped per day; allowlisting a guild ("paying") lets it actually enforce. The
+# allowlist is the bot owner's, via SENTRY_ALLOWLIST (comma ids) or /sentry allowlist.
 FREE_SCAN_LIMIT = int(os.getenv("SENTRY_FREE_SCAN_LIMIT", "50"))  # free scans per UTC day
 DEFAULT_DRY_RUN = True  # watch-only until a (premium) guild opts into enforcing
 ALLOWLIST_ENV = {
@@ -1100,12 +1095,9 @@ def _premium(guild_id: int) -> bool:
 
 
 def _effective_disabled(guild_id: int, cfg: dict) -> set:
-    """Categories that won't act: the guild's own choices, plus — for a free guild —
-    every category except the two baseline (free) ones."""
-    disabled = set(cfg.get("disabled_categories", []))
-    if not _premium(guild_id):
-        disabled |= ALL_CATEGORIES - FREE_CATEGORIES
-    return disabled
+    """Categories that won't act — just the guild's own choices. Every tier watches
+    all categories; the free/premium difference is enforcement, not detection."""
+    return set(cfg.get("disabled_categories", []))
 
 
 def _effective_dry(guild_id: int, cfg: dict) -> bool:
@@ -1228,15 +1220,14 @@ def _tier_note(guild_id: int) -> str:
     """A short free-vs-premium blurb for the review channel."""
     if _premium(guild_id):
         return (
-            "**Premium** — all categories + enforcement enabled. "
+            "**Premium** — flagged images are removed automatically. "
             "Questions? DM **zukothedog** on Discord."
         )
     return (
-        f"**Free tier** — only `sexual_nudity` + `minor_sexual`, watch-only (nothing "
-        f"removed except CSAM), and {FREE_SCAN_LIMIT} scans/day.\n"
-        "**Premium** unlocks every category (gore, hate symbols, doxxing, self-harm, "
-        "drugs, scam/spam…), lets you actually remove flagged images, and lifts the "
-        "scan cap. DM **zukothedog** on Discord to upgrade."
+        f"**Free tier** — watch-only: everything is detected and reported here, but "
+        f"**nothing is removed** (except CSAM), capped at {FREE_SCAN_LIMIT} scans/day.\n"
+        "**Premium** actually removes flagged images and lifts the scan cap. DM "
+        "**zukothedog** on Discord to upgrade."
     )
 
 
@@ -1256,9 +1247,9 @@ async def _post_ad(channel: discord.abc.Messageable) -> None:
         _ad_last.pop(k, None)  # drop expired entries to bound memory
     embed = discord.Embed(
         description=(
-            "🛡️ A message was removed by **Dachi Warden** — automatic image moderation "
-            "for Discord.\nWant it on your server? DM **zukothedog** on Discord — "
-            "free & premium tiers available."
+            "🛡️ Moderated by **Dachi Warden** — automatic image moderation for Discord.\n"
+            "Want it protecting your server? DM **zukothedog** on Discord — free & "
+            "premium tiers available."
         ),
         colour=discord.Colour.blurple(),
     )
@@ -1435,6 +1426,8 @@ async def _run_moderation(
                 sha256=hashlib.sha256(raw).hexdigest(),
             )
         await _log_dry_flag(message, flagged, cfg)
+        if not premium:  # advertise on free servers (premium dry-run is just testing)
+            await _post_ad(channel)
         return False
 
     # A message is atomic — one bad item takes the whole message with it.
@@ -1685,17 +1678,6 @@ async def category_cmd(
     action: app_commands.Choice[str],
 ):
     cfg = state.guild(interaction.guild.id)
-    if (
-        action.value == "on"
-        and category.value not in FREE_CATEGORIES
-        and not _premium(interaction.guild.id)
-    ):
-        await interaction.response.send_message(
-            f"**{category.value}** is a premium category. This server can only use "
-            f"{', '.join(sorted(FREE_CATEGORIES))} — ask the bot owner to upgrade it.",
-            ephemeral=True,
-        )
-        return
     disabled = cfg.setdefault("disabled_categories", [])
     if action.value == "off":
         if category.value not in disabled:
@@ -1846,7 +1828,9 @@ async def status_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="Sentry status", colour=discord.Colour.blurple())
     embed.add_field(
         name="Tier",
-        value="✅ premium" if premium else f"free ({FREE_SCAN_LIMIT} scans/day, 2 categories)",
+        value="✅ premium"
+        if premium
+        else f"free (watch-only, {FREE_SCAN_LIMIT} scans/day)",
     )
     embed.add_field(name="Scanning", value="on" if cfg["enabled"] else "off")
     embed.add_field(
