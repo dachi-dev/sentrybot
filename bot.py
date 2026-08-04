@@ -1025,6 +1025,15 @@ async def _sync_commands_to_guilds():
 
 
 @bot.event
+async def on_interaction(interaction: discord.Interaction):
+    name = (interaction.data or {}).get("name") if interaction.data else None
+    log.info(
+        "DIAG interaction received: type=%s name=%s guild=%s user=%s",
+        interaction.type, name, interaction.guild_id, interaction.user.id,
+    )
+
+
+@bot.event
 async def on_ready():
     global _synced_once
     log.info("connected as %s (%d guilds)", bot.user, len(bot.guilds))
