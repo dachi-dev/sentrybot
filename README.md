@@ -37,6 +37,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry sensitivity` | `relaxed` / `standard` / `strict` (what Claude flags) |
 | `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
 | `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`) |
+| `/sentry allow` | Add/list/remove **community-specific allowances** — exceptions Sentry won't flag |
 | `/sentry dryrun` | Observe-only mode: report flags to the review channel, remove nothing |
 | `/sentry alertrole` | Role to ping on **every removal** |
 | `/sentry allowlist` | **(bot owner only)** grant/revoke a server's premium access by ID |
@@ -92,6 +93,27 @@ subject to the confidence threshold.
 | `self_harm` | yes | depicting/promoting suicide or self-harm |
 | `drugs` | yes | hard/illegal drug use, sale, promotion |
 | `scam_spam` | yes | phishing, crypto/giveaway scams, mass ads |
+
+### Allowances (community-specific exceptions)
+
+Categories are one-size-fits-all, but communities aren't. `/sentry allow` lets a server's
+mods declare plain-language exceptions that are injected into the classifier, so an image
+is **not** flagged when its *only* reason to be flagged is something the community has
+explicitly permitted. The canonical case: a predominantly Black server allowing reclaimed
+in-group use of a slur that would otherwise trip `hate_symbol`.
+
+```
+/sentry allow add   reclaimed in-group use of the n-word is allowed here
+/sentry allow list
+/sentry allow remove 1
+/sentry allow clear
+```
+
+Because Sentry is an **image** moderator, this applies to text/slurs *rendered in an
+image* (memes, screenshots), not to plain chat messages. Allowances are per-server (up to
+20), never excuse anything not listed, and can also be edited from the admin dashboard.
+Keep them specific — a vague allowance ("anything offensive is fine") will broadly blunt
+detection.
 
 ## Child sexual abuse material (CSAM)
 

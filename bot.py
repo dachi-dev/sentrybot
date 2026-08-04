@@ -174,6 +174,7 @@ _GUILD_DEFAULTS: dict[str, Any] = {
     "scan_count": 0,  # scans used in that window
     "quota_notified": False,  # posted the "quota reached" notice yet
     "alert_role": None,  # role pinged on every removal
+    "allowances": list,  # community-specific exceptions injected into the prompt
 }
 
 
@@ -293,9 +294,30 @@ Sensitivity level "{sensitivity}":
 - standard: flag when a reasonable moderator on a general-audience server would.
 - strict: also flag suggestive-but-not-explicit sexual content, moderate blood, \
 and borderline cases in the other categories.
-
+{allowances}
 Respond with exactly this JSON shape and nothing else:
 {{"verdict": "allow" | "block", "category": "clean" | "sexual_nudity" | "gore" | "hate_symbol" | "violence_threat" | "harassment_doxxing" | "self_harm" | "drugs" | "scam_spam", "confidence": 0.0-1.0, "reason": "<max 12 words, non-graphic>"}}"""
+
+
+ALLOWANCE_MAX = 20  # cap how many custom rules go into the prompt
+
+
+def _allowances_text(cfg: dict) -> str:
+    """Render a guild's custom allowances into a prompt block (empty if none). These
+    let a server carve out community-specific exceptions — e.g. a predominantly Black
+    community permitting reclaimed in-group use of a slur that would otherwise be
+    flagged as hate_symbol."""
+    rules = [str(r).strip() for r in cfg.get("allowances", []) if str(r).strip()]
+    if not rules:
+        return ""
+    lines = "\n".join(f"- {r}" for r in rules[:ALLOWANCE_MAX])
+    return (
+        "\nServer-specific allowances — this community has explicitly permitted the "
+        'following. Return "clean"/"allow" for an image whose ONLY reason to be flagged '
+        "is one of these (for example reclaimed in-group use of a slur). They never "
+        "excuse anything not listed here:\n"
+        f"{lines}\n"
+    )
 
 
 def _cache_get(key: str) -> dict | None:
@@ -370,7 +392,9 @@ def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 
 
-async def _classify_one(data: str, media_type: str, sensitivity: str) -> dict:
+async def _classify_one(
+    data: str, media_type: str, sensitivity: str, allowances: str = ""
+) -> dict:
     """One Claude vision call on one prepared frame, retrying transient failures with
     backoff. Never raises; fails open (verdict=allow, error=True) once it gives up."""
     for attempt in range(3):
@@ -379,7 +403,9 @@ async def _classify_one(data: str, media_type: str, sensitivity: str) -> dict:
                 resp = await claude.messages.create(
                     model=MODEL,
                     max_tokens=150,
-                    system=SYSTEM_PROMPT.format(sensitivity=sensitivity),
+                    system=SYSTEM_PROMPT.format(
+                        sensitivity=sensitivity, allowances=allowances
+                    ),
                     messages=[
                         {
                             "role": "user",
@@ -436,11 +462,16 @@ async def _classify_one(data: str, media_type: str, sensitivity: str) -> dict:
     }
 
 
-async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
+async def classify(
+    raw: bytes, mime: str, sensitivity: str, allowances: str = ""
+) -> dict:
     """Return a verdict dict for an image. Never raises. For an animation, frames are
     checked in order and the first blocked frame condemns the whole thing."""
     digest = hashlib.sha256(raw).hexdigest()
-    cache_key = f"{digest}:{sensitivity}"
+    # Allowances change the verdict, so they must be part of the cache key — otherwise
+    # one guild's exception would leak to another via the shared process cache.
+    allow_key = hashlib.sha256(allowances.encode()).hexdigest()[:12] if allowances else ""
+    cache_key = f"{digest}:{sensitivity}:{allow_key}"
     if cached := _cache_get(cache_key):
         return cached
 
@@ -459,7 +490,7 @@ async def classify(raw: bytes, mime: str, sensitivity: str) -> dict:
 
     verdict = None
     for data, media_type in frames:
-        verdict = await _classify_one(data, media_type, sensitivity)
+        verdict = await _classify_one(data, media_type, sensitivity, allowances)
         if verdict.get("verdict") == "block":
             break  # one bad frame is enough
 
@@ -1365,10 +1396,9 @@ async def _run_moderation(
     author = message.author
     channel = message.channel
     sensitivity = cfg.get("sensitivity", "standard")
+    allowances = _allowances_text(cfg)
     premium = _premium(message.guild.id)
 
-    # Free tier: cap scans per UTC day. Reset the window on a new day, and stop
-    # scanning (once) when the quota is spent.
     # Track daily scan volume for EVERY guild (drives the dashboard's activity
     # metric); reset the window on a new UTC day. Free tier additionally enforces
     # a hard cap — premium is uncapped but still counted.
@@ -1411,7 +1441,7 @@ async def _run_moderation(
                 "error": False,
             }
         fresh += 1
-        return await classify(raw, mime, sensitivity)
+        return await classify(raw, mime, sensitivity, allowances)
 
     results = await asyncio.gather(
         *(verdict_for(mime, raw) for _, mime, raw in payloads)
@@ -1990,7 +2020,10 @@ async def post_cmd(
         return
 
     verdict = await classify(
-        raw, image.content_type or "image/png", cfg.get("sensitivity", "standard")
+        raw,
+        image.content_type or "image/png",
+        cfg.get("sensitivity", "standard"),
+        _allowances_text(cfg),
     )
 
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
@@ -2030,6 +2063,80 @@ async def post_cmd(
     await interaction.followup.send("Approved and posted.", ephemeral=True)
 
 
+# --- /sentry allow: per-server exceptions injected into the classifier prompt ---
+allow = app_commands.Group(
+    name="allow",
+    description="Community-specific exceptions Sentry should not flag",
+    parent=mod,
+)
+
+
+@allow.command(
+    name="add", description="Permit something Sentry would otherwise flag (e.g. reclaimed slur)"
+)
+@app_commands.describe(rule="Describe what to allow, in plain words")
+async def allow_add(interaction: discord.Interaction, rule: str):
+    cfg = state.guild(interaction.guild.id)
+    rule = rule.strip()[:200]
+    if not rule:
+        await interaction.response.send_message("Nothing to add.", ephemeral=True)
+        return
+    rules = cfg.setdefault("allowances", [])
+    if len(rules) >= ALLOWANCE_MAX:
+        await interaction.response.send_message(
+            f"At the limit of {ALLOWANCE_MAX} allowances — remove one first.", ephemeral=True
+        )
+        return
+    if rule in rules:
+        await interaction.response.send_message("That allowance already exists.", ephemeral=True)
+        return
+    rules.append(rule)
+    state.save()
+    await interaction.response.send_message(
+        f"Added allowance #{len(rules)}: `{rule}`.\nSentry will no longer flag an image "
+        "whose only issue is this. It never excuses anything else.",
+        ephemeral=True,
+    )
+
+
+@allow.command(name="list", description="Show this server's allowances")
+async def allow_list(interaction: discord.Interaction):
+    rules = state.guild(interaction.guild.id).get("allowances", [])
+    if not rules:
+        await interaction.response.send_message(
+            "No allowances set. Add one with `/sentry allow add`.", ephemeral=True
+        )
+        return
+    body = "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1))
+    await interaction.response.send_message(
+        f"**Allowances for this server:**\n{body}", ephemeral=True
+    )
+
+
+@allow.command(
+    name="remove", description="Remove an allowance by its number (see /sentry allow list)"
+)
+@app_commands.describe(number="The number shown by /sentry allow list")
+async def allow_remove(interaction: discord.Interaction, number: int):
+    cfg = state.guild(interaction.guild.id)
+    rules = cfg.get("allowances", [])
+    if not 1 <= number <= len(rules):
+        await interaction.response.send_message(
+            f"No allowance #{number}. Check `/sentry allow list`.", ephemeral=True
+        )
+        return
+    removed = rules.pop(number - 1)
+    state.save()
+    await interaction.response.send_message(f"Removed: `{removed}`.", ephemeral=True)
+
+
+@allow.command(name="clear", description="Remove all allowances for this server")
+async def allow_clear(interaction: discord.Interaction):
+    state.guild(interaction.guild.id)["allowances"] = []
+    state.save()
+    await interaction.response.send_message("All allowances cleared.", ephemeral=True)
+
+
 bot.tree.add_command(mod)
 
 
@@ -2059,6 +2166,7 @@ button{cursor:pointer;padding:4px 10px}code{font-size:13px}
 fieldset{border:1px solid #ccc;border-radius:6px;margin:1rem 0;padding:.6rem 1rem}
 legend{font-weight:600;padding:0 .4rem}label{display:block;margin:.35rem 0}
 input[type=text],select{padding:3px 6px;min-width:16rem}
+textarea{width:100%;box-sizing:border-box;padding:6px;font:inherit}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:.2rem 1.5rem}
 .note{color:#666;font-size:13px}.warn{color:#b45309}</style>"""
 
@@ -2251,6 +2359,7 @@ def _guild_settings_page(token: str, gid: int) -> str:
         else ""
     )
     used = cfg.get("scan_count", 0) if cfg.get("scan_day") == _today() else 0
+    allow_text = _esc("\n".join(cfg.get("allowances", [])))
     activity_html = _audit_table(_read_audit(15, gid))
 
     return f"""<!doctype html><meta charset=utf-8>
@@ -2273,6 +2382,12 @@ def _guild_settings_page(token: str, gid: int) -> str:
 </fieldset>
 <fieldset><legend>Categories (checked = flagged)</legend>
 <div class=grid>{cat_boxes}</div>
+</fieldset>
+<fieldset><legend>Allowances <span class=note>(one per line, max {ALLOWANCE_MAX})</span></legend>
+<p class=note>Community-specific exceptions injected into the classifier — an image is
+not flagged if its only issue is listed here (e.g. reclaimed in-group slur use). Never
+excuses anything else.</p>
+<textarea name=allowances rows=4>{allow_text}</textarea>
 </fieldset>
 <fieldset><legend>Channel / role bindings <span class=note>(numeric IDs; blank = unset)</span></legend>
 <label>Review channel ID:
@@ -2355,6 +2470,11 @@ async def _admin_guild_save(request: "web.Request") -> "web.Response":
         int(x) for x in re.split(r"[,\s]+", str(data.get("exempt_channels", "")))
         if x.strip().isdigit()
     ]
+    cfg["allowances"] = [
+        ln.strip()[:200]
+        for ln in str(data.get("allowances", "")).splitlines()
+        if ln.strip()
+    ][:ALLOWANCE_MAX]
     state.save()
     raise web.HTTPFound(f"/guild?id={gid}&token={token}")
 
