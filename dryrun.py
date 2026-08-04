@@ -67,6 +67,7 @@ class FakeChannel:
 
     async def send(self, **kw):
         EVENTS.append(("review_post", kw))
+        return SimpleNamespace(jump_url="http://discord/case/1")
 
 
 class FakeRole:
@@ -96,6 +97,8 @@ class FakeGuild:
         self.id, self.name = gid, "Test Server"
         self.review = FakeChannel(77, "mod-review")
         self._role = FakeRole()
+        self.owner = FakeMember(self)  # DMs land as ("dm", ...) events
+        self.owner_id = self.owner.id
 
     def get_role(self, rid):
         return self._role

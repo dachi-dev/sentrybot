@@ -38,6 +38,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
 | `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`); CSAM can't be disabled |
 | `/sentry dryrun` | Observe-only mode: report flags to the review channel, remove nothing (CSAM still removed) |
+| `/sentry alertrole` | Role to ping on a critical (CSAM) case; the server owner is always DM'd |
 | `/sentry allowlist` | **(bot owner only)** grant/revoke a server's premium access by ID |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
@@ -75,6 +76,42 @@ to the uploader.
 **A Discord message is atomic.** If someone attaches four images and one is flagged,
 the whole message goes — there is no API for removing a single attachment from another
 user's message. The case embed shows how many files tripped it.
+
+## Categories
+
+Every category except `minor_sexual` can be turned on/off per server with
+`/sentry category` and is subject to the confidence threshold.
+
+| Category | Configurable | Flags |
+|---|---|---|
+| `sexual_nudity` | yes | explicit nudity / sexual content |
+| `gore` | yes | graphic real injury, mutilation, real death |
+| `hate_symbol` | yes | Nazi/extremist symbols, slurs, hateful caricatures |
+| `violence_threat` | yes | glorifying terrorism/mass violence, credible threats |
+| `harassment_doxxing` | yes | exposing a private person's personal info |
+| `self_harm` | yes | depicting/promoting suicide or self-harm |
+| `drugs` | yes | hard/illegal drug use, sale, promotion |
+| `scam_spam` | yes | phishing, crypto/giveaway scams, mass ads |
+| `minor_sexual` | **no — always on** | A non-configurable **safety net**, not a marketed feature. It can't be disabled, set to watch-only, or tuned by threshold. **Primary detection of this content is Discord's responsibility, not this bot's** — Sentry only acts as a last-line backstop for what reaches a channel. See the CSAM policy below. |
+
+## CSAM policy
+
+Suspected sexual content involving a minor (`minor_sexual`) is treated as a safety
+backstop, not a feature:
+
+- **Primary detection is deferred to Discord.** Discord runs platform-level detection and
+  reporting for this content (including to NCMEC); Sentry is only a secondary backstop for
+  what still reaches a channel.
+- **The bot never stores or redistributes it.** It is removed on sight, never re-uploaded
+  to the review channel, never written to the blocked-image archive, and never posted
+  anywhere. Only a **SHA-256 fingerprint and short non-graphic metadata** are retained (to
+  re-block reposts) — never the image bytes.
+- **A human is alerted immediately** — the server owner is DM'd a link to the case, and an
+  optional alert role (`/sentry alertrole`) is pinged in the review channel.
+- **Moderators/operators must report the account to Discord** (Trust & Safety,
+  <https://dis.gd/report>), who handle NCMEC reporting; in the US you may also report
+  directly to the NCMEC CyberTipline (<https://report.cybertip.org>). Do not attempt to
+  retrieve or forward the content.
 
 ## Restriction mechanic
 

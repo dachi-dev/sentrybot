@@ -173,6 +173,7 @@ class State:
                 "scan_day": None,  # UTC date of the current free-tier quota window
                 "scan_count": 0,  # scans used in that window
                 "quota_notified": False,  # posted the "quota reached" notice yet
+                "alert_role": None,  # role pinged on a critical (CSAM) case
             },
         )
 
@@ -1588,15 +1589,49 @@ async def open_case(
         for name, raw, _ in flagged[:5]:
             files.append(discord.File(io.BytesIO(raw), filename=f"SPOILER_{name}"))
 
+    content = None
+    mentions = discord.AllowedMentions.none()
+    alert_role = cfg.get("alert_role") if critical else None
+    if alert_role:
+        content = f"<@&{alert_role}> — **critical case, review immediately.**"
+        mentions = discord.AllowedMentions(
+            everyone=False, users=False, roles=[discord.Object(id=alert_role)]
+        )
     try:
-        await review.send(
+        sent = await review.send(
+            content=content,
             embed=embed,
             files=files,
             view=None if critical else ReviewView(),
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=mentions,
         )
     except discord.Forbidden:
         log.warning("cannot post to review channel")
+        return
+    if critical:
+        await _alert_owner(message.guild, sent)
+
+
+async def _alert_owner(guild: discord.Guild, case_message: discord.Message):
+    """DM the server owner about a critical (CSAM) case with a link to it. Best-effort."""
+    owner = guild.owner
+    if owner is None and guild.owner_id:
+        try:
+            owner = await guild.fetch_member(guild.owner_id)
+        except discord.HTTPException:
+            owner = None
+    if owner is None:
+        return
+    try:
+        await owner.send(
+            f"⚠️ **Critical case in {guild.name}** — suspected sexual content involving a "
+            f"minor was detected and removed. Review it here: {case_message.jump_url}\n"
+            "Report the account to Discord Trust & Safety (<https://dis.gd/report>); in the "
+            "US you may also report to the NCMEC CyberTipline (<https://report.cybertip.org>). "
+            "The image was not stored anywhere."
+        )
+    except discord.Forbidden:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -1717,6 +1752,25 @@ async def category_cmd(
         msg = f"**{category.value}** is now **on**."
     state.save()
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+@mod.command(
+    name="alertrole",
+    description="Role to ping on a critical (CSAM) case; the owner is always DM'd too",
+)
+@app_commands.describe(role="Role to alert on critical cases; leave empty to clear")
+async def alertrole_cmd(
+    interaction: discord.Interaction, role: discord.Role | None = None
+):
+    cfg = state.guild(interaction.guild.id)
+    cfg["alert_role"] = role.id if role else None
+    state.save()
+    await interaction.response.send_message(
+        f"Critical-case alerts will ping {role.mention}. The server owner is DM'd too."
+        if role
+        else "Critical-case alert role cleared. The server owner is still DM'd on critical cases.",
+        ephemeral=True,
+    )
 
 
 @mod.command(
