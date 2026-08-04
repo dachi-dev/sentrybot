@@ -173,7 +173,7 @@ class State:
                 "scan_day": None,  # UTC date of the current free-tier quota window
                 "scan_count": 0,  # scans used in that window
                 "quota_notified": False,  # posted the "quota reached" notice yet
-                "alert_role": None,  # role pinged on a critical (CSAM) case
+                "alert_role": None,  # role pinged on every removal (owner DM stays CSAM-only)
             },
         )
 
@@ -1591,9 +1591,13 @@ async def open_case(
 
     content = None
     mentions = discord.AllowedMentions.none()
-    alert_role = cfg.get("alert_role") if critical else None
+    alert_role = cfg.get("alert_role")
     if alert_role:
-        content = f"<@&{alert_role}> — **critical case, review immediately.**"
+        content = (
+            f"<@&{alert_role}> — **critical case, review immediately.**"
+            if critical
+            else f"<@&{alert_role}> — flagged content removed."
+        )
         mentions = discord.AllowedMentions(
             everyone=False, users=False, roles=[discord.Object(id=alert_role)]
         )
@@ -1756,9 +1760,9 @@ async def category_cmd(
 
 @mod.command(
     name="alertrole",
-    description="Role to ping on a critical (CSAM) case; the owner is always DM'd too",
+    description="Role to ping on every removal; the owner is also DM'd on critical (CSAM) cases",
 )
-@app_commands.describe(role="Role to alert on critical cases; leave empty to clear")
+@app_commands.describe(role="Role to ping whenever content is removed; leave empty to clear")
 async def alertrole_cmd(
     interaction: discord.Interaction, role: discord.Role | None = None
 ):
@@ -1766,9 +1770,9 @@ async def alertrole_cmd(
     cfg["alert_role"] = role.id if role else None
     state.save()
     await interaction.response.send_message(
-        f"Critical-case alerts will ping {role.mention}. The server owner is DM'd too."
+        f"{role.mention} will be pinged on every removal. The owner is also DM'd on critical (CSAM) cases."
         if role
-        else "Critical-case alert role cleared. The server owner is still DM'd on critical cases.",
+        else "Alert role cleared. The server owner is still DM'd on critical (CSAM) cases.",
         ephemeral=True,
     )
 

@@ -196,6 +196,32 @@ async def main():
         [FakeAttachment("y.png", (80, 80, 80))], raise_error=True,
     )
 
+    # alert role pings on EVERY removal, not just CSAM
+    for label, verdict in (("non-CSAM (gore)", gore), ("critical (CSAM)", csam)):
+        EVENTS.clear(); CALLS.clear(); sentry.verdict_cache.clear()
+        NEXT_VERDICT.clear(); NEXT_VERDICT.update(payload=verdict); NEXT_VERDICT["raise"] = False
+        guild = FakeGuild()
+        cfg = sentry.state.guild(guild.id)
+        cfg["review_channel"] = 77
+        cfg["restricted_role"] = 999
+        cfg["approved_hashes"] = []
+        cfg["blocked_hashes"] = {}
+        cfg["disabled_categories"] = []
+        cfg["dry_run"] = False
+        cfg["alert_role"] = 555
+        att = FakeAttachment("alert.png", (170, 20, 20))
+        msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "look at this")
+        await sentry.process(msg, [att], cfg)
+        pinged = any(
+            e[0] == "review_post" and "555" in str(e[1].get("content") or "")
+            for e in EVENTS
+        )
+        owner_dm = any(e[0] == "dm" and "Critical" in str(e[1]) for e in EVENTS)
+        print(f"\n=== alert role on a {label} removal ===")
+        print(f"  role pinged (want Yes): {pinged}")
+        print(f"  owner DM'd (want {'Yes' if verdict is csam else 'No'}): {owner_dm}")
+    cfg["alert_role"] = None
+
     # cache: same bytes twice should cost one call
     EVENTS.clear()
     CALLS.clear()
