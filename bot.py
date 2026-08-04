@@ -77,6 +77,20 @@ API_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
 CONFIDENCE_LEVELS = {"low": 0.60, "medium": 0.75, "high": 0.90}
 DEFAULT_MIN_CONFIDENCE = CONFIDENCE_LEVELS["medium"]
 
+# Every moderation category, in display order. Single source of truth shared by the
+# /sentry category command and the admin dashboard.
+CATEGORIES = (
+    "sexual_nudity",
+    "gore",
+    "hate_symbol",
+    "violence_threat",
+    "harassment_doxxing",
+    "self_harm",
+    "drugs",
+    "scam_spam",
+)
+SENSITIVITY_LEVELS = ("relaxed", "standard", "strict")
+
 # Feature gating (monetization). A non-allowlisted ("free") guild watches every
 # category but is locked to watch-only mode (reports, removes nothing) and
 # is capped per day; allowlisting a guild ("paying") lets it actually enforce. The
@@ -1675,16 +1689,7 @@ async def threshold_cmd(
 @mod.command(name="category", description="Turn a moderation category on or off")
 @app_commands.describe(category="Which category", action="Turn it on or off")
 @app_commands.choices(
-    category=[
-        app_commands.Choice(name="sexual_nudity", value="sexual_nudity"),
-        app_commands.Choice(name="gore", value="gore"),
-        app_commands.Choice(name="hate_symbol", value="hate_symbol"),
-        app_commands.Choice(name="violence_threat", value="violence_threat"),
-        app_commands.Choice(name="harassment_doxxing", value="harassment_doxxing"),
-        app_commands.Choice(name="self_harm", value="self_harm"),
-        app_commands.Choice(name="drugs", value="drugs"),
-        app_commands.Choice(name="scam_spam", value="scam_spam"),
-    ],
+    category=[app_commands.Choice(name=c, value=c) for c in CATEGORIES],
     action=[
         app_commands.Choice(name="off — ignore images flagged as this", value="off"),
         app_commands.Choice(name="on — flag images in this category", value="on"),
@@ -2008,28 +2013,133 @@ def _admin_authed(request: "web.Request") -> bool:
     return hmac.compare_digest(supplied, ADMIN_TOKEN)
 
 
+_ADMIN_STYLE = """<style>
+body{font:15px system-ui;margin:2rem;max-width:820px;color:#111}
+a{color:#2b6cb0}table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}
+button{cursor:pointer;padding:4px 10px}code{font-size:13px}
+fieldset{border:1px solid #ccc;border-radius:6px;margin:1rem 0;padding:.6rem 1rem}
+legend{font-weight:600;padding:0 .4rem}label{display:block;margin:.35rem 0}
+input[type=text],select{padding:3px 6px;min-width:16rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.2rem 1.5rem}
+.note{color:#666;font-size:13px}.warn{color:#b45309}</style>"""
+
+
+def _premium_form(token: str, gid: int) -> str:
+    if state.is_env_allowed(gid):
+        return "<em>via SENTRY_ALLOWLIST</em>"
+    nxt = "remove" if state.is_state_allowed(gid) else "add"
+    label = "Revoke premium" if nxt == "remove" else "Grant premium"
+    return (
+        f"<form method=post action='/set?token={_esc(token)}' style='display:inline'>"
+        f"<input type=hidden name=guild_id value='{gid}'>"
+        f"<input type=hidden name=action value='{nxt}'>"
+        f"<button>{label}</button></form>"
+    )
+
+
+def _today() -> str:
+    return discord.utils.utcnow().date().isoformat()
+
+
+def _config_issues(gid: int, cfg: dict) -> list[str]:
+    """Human-readable misconfigurations that would silently break moderation."""
+    issues = []
+    if cfg.get("enabled", True) and not cfg.get("review_channel"):
+        issues.append("no review channel set — flagged cases can't be posted")
+    if (
+        state.is_allowed(gid)
+        and not cfg.get("dry_run", DEFAULT_DRY_RUN)
+        and not cfg.get("restricted_role")
+    ):
+        issues.append("no restricted role — offenders are deleted but not restricted")
+    return issues
+
+
+def _read_audit(limit: int = 50, guild_id: int | None = None) -> list[dict]:
+    """Most-recent-first audit records from the current log file. Best-effort."""
+    try:
+        lines = AUDIT_LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in reversed(lines):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if guild_id is not None and str(rec.get("guild")) != str(guild_id):
+            continue
+        out.append(rec)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _audit_table(records: list[dict], show_guild: bool = False) -> str:
+    if not records:
+        return "<p class=note>No recorded activity yet.</p>"
+    head = "<tr><th>Time (UTC)</th><th>Event</th>"
+    if show_guild:
+        head += "<th>Guild</th>"
+    head += "<th>Category</th><th>Conf.</th><th>Reason</th><th>User</th></tr>"
+    body = ""
+    for r in records:
+        ts = _esc(str(r.get("ts", ""))[:19].replace("T", " "))
+        conf = r.get("confidence")
+        conf = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
+        reason = _esc(str(r.get("reason") or ""))[:60]
+        user = r.get("user") or r.get("actor") or "—"
+        body += f"<tr><td>{ts}</td><td>{_esc(str(r.get('event','')))}</td>"
+        if show_guild:
+            body += f"<td><code>{_esc(str(r.get('guild', '—')))}</code></td>"
+        body += (
+            f"<td>{_esc(str(r.get('category') or '—'))}</td><td>{conf}</td>"
+            f"<td>{reason}</td><td><code>{_esc(str(user))}</code></td></tr>"
+        )
+    return f"<table>{head}{body}</table>"
+
+
 def _admin_page(token: str) -> str:
     in_guild = {g.id: g for g in bot.guilds}
-
-    def action_cell(gid: int) -> str:
-        if state.is_env_allowed(gid):
-            return "<em>via SENTRY_ALLOWLIST</em>"
-        nxt = "remove" if state.is_state_allowed(gid) else "add"
-        label = "Revoke" if nxt == "remove" else "Grant premium"
-        return (
-            f"<form method=post action='/set?token={_esc(token)}'>"
-            f"<input type=hidden name=guild_id value='{gid}'>"
-            f"<input type=hidden name=action value='{nxt}'>"
-            f"<button>{label}</button></form>"
+    today = _today()
+    n_premium = sum(1 for g in bot.guilds if state.is_allowed(g.id))
+    scans_today = sum(
+        cfg.get("scan_count", 0)
+        for g in bot.guilds
+        if (cfg := state.guild(g.id)).get("scan_day") == today
+    )
+    n_issues = sum(1 for g in bot.guilds if _config_issues(g.id, state.guild(g.id)))
+    summary = (
+        f"<p><b>{len(bot.guilds)}</b> servers · <b>{n_premium}</b> premium · "
+        f"<b>{scans_today}</b> scans today · "
+        + (
+            f"<span class=warn><b>{n_issues}</b> with config issues</span>"
+            if n_issues
+            else "no config issues"
         )
+        + f" · <a href='/activity?token={_esc(token)}'>recent activity →</a></p>"
+    )
+
+    def settings_link(gid: int) -> str:
+        return f"<a href='/guild?id={gid}&token={_esc(token)}'>Settings</a>"
 
     rows = ""
     for g in sorted(bot.guilds, key=lambda x: (x.name or "").lower()):
         badge = "✅ premium" if state.is_allowed(g.id) else "free"
+        issues = _config_issues(g.id, state.guild(g.id))
+        health = (
+            f"<span class=warn title='{_esc('; '.join(issues))}'>⚠️ {len(issues)}</span>"
+            if issues
+            else "✓"
+        )
         rows += (
             f"<tr><td>{_esc(g.name)}</td><td><code>{g.id}</code></td>"
-            f"<td>{g.member_count or '?'}</td><td>{badge}</td>"
-            f"<td>{action_cell(g.id)}</td></tr>"
+            f"<td>{g.member_count or '?'}</td><td>{badge}</td><td>{health}</td>"
+            f"<td>{_premium_form(token, g.id)}</td><td>{settings_link(g.id)}</td></tr>"
         )
     # allowlisted ids the bot isn't currently in
     extra = ""
@@ -2037,22 +2147,121 @@ def _admin_page(token: str) -> str:
         if int(gid) not in in_guild:
             extra += (
                 f"<tr><td><em>not joined</em></td><td><code>{_esc(gid)}</code></td>"
-                f"<td>—</td><td>✅ premium</td><td>{action_cell(int(gid))}</td></tr>"
+                f"<td>—</td><td>✅ premium</td><td>—</td>"
+                f"<td>{_premium_form(token, int(gid))}</td>"
+                f"<td>{settings_link(int(gid))}</td></tr>"
             )
     return f"""<!doctype html><meta charset=utf-8>
-<title>Sentry admin</title>
-<style>body{{font:15px system-ui;margin:2rem;max-width:820px}}
-table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:6px 10px;text-align:left}}
-button{{cursor:pointer}}code{{font-size:13px}}</style>
-<h2>Sentry — premium allowlist</h2>
-<p>Grant a server access to all categories + enforcement, or revoke it.</p>
-<table><tr><th>Server</th><th>ID</th><th>Members</th><th>Tier</th><th></th></tr>
+<title>Sentry admin</title>{_ADMIN_STYLE}
+<h2>Sentry — servers</h2>
+{summary}
+<p>Grant premium (all categories + enforcement) or open <b>Settings</b> to change any
+per-server knob.</p>
+<table><tr><th>Server</th><th>ID</th><th>Members</th><th>Tier</th><th>Health</th>
+<th>Premium</th><th>Config</th></tr>
 {rows}{extra}</table>
 <h3>Add a server by ID</h3>
 <form method=post action='/set?token={_esc(token)}'>
-<input name=guild_id placeholder='server id' required>
+<input type=text name=guild_id placeholder='server id' required>
 <input type=hidden name=action value='add'>
 <button>Grant premium</button></form>"""
+
+
+def _guild_settings_page(token: str, gid: int) -> str:
+    cfg = state.guild(gid)
+    g = bot.get_guild(gid)
+    name = _esc(g.name) if g else "<em>not joined</em>"
+    premium = state.is_allowed(gid)
+
+    def checked(cond: bool) -> str:
+        return " checked" if cond else ""
+
+    def sel(values, current) -> str:
+        return "".join(
+            f"<option value='{v}'{' selected' if v == current else ''}>{v}</option>"
+            for v in values
+        )
+
+    disabled = set(cfg.get("disabled_categories", []))
+    cat_boxes = "".join(
+        f"<label><input type=checkbox name='cat_{c}'{checked(c not in disabled)}> {c}</label>"
+        for c in CATEGORIES
+    )
+    min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
+    level = next(
+        (k for k, v in CONFIDENCE_LEVELS.items() if abs(v - min_conf) < 1e-9), "medium"
+    )
+    exempt = ", ".join(str(c) for c in cfg.get("exempt_channels", []))
+    free_note = (
+        ""
+        if premium
+        else "<p class=warn>This server is <b>free</b> — it stays watch-only "
+        "(nothing is removed) and capped regardless of the Mode/category settings "
+        "below. Grant premium to make enforcement take effect.</p>"
+    )
+
+    def val(key):
+        v = cfg.get(key)
+        return "" if v is None else str(v)
+
+    issues = _config_issues(gid, cfg)
+    issues_html = (
+        "<p class=warn><b>⚠️ Config issues:</b><br>"
+        + "<br>".join(_esc(i) for i in issues)
+        + "</p>"
+        if issues
+        else ""
+    )
+    used = cfg.get("scan_count", 0) if cfg.get("scan_day") == _today() else 0
+    activity_html = _audit_table(_read_audit(15, gid))
+
+    return f"""<!doctype html><meta charset=utf-8>
+<title>Sentry — {name}</title>{_ADMIN_STYLE}
+<p><a href='/?token={_esc(token)}'>← all servers</a></p>
+<h2>{name} <code>{gid}</code></h2>
+<p>Tier: <b>{'✅ premium' if premium else 'free'}</b> &nbsp; {_premium_form(token, gid)}</p>
+{issues_html}{free_note}
+<form method=post action='/guild/save?token={_esc(token)}'>
+<input type=hidden name=guild_id value='{gid}'>
+<fieldset><legend>Behavior</legend>
+<label><input type=checkbox name=enabled{checked(cfg.get('enabled', True))}>
+  Scanning enabled (server-wide)</label>
+<label><input type=checkbox name=enforce{checked(not cfg.get('dry_run', DEFAULT_DRY_RUN))}>
+  Enforce — remove flagged images (unchecked = watch-only / dry run)</label>
+<label>Sensitivity (what Claude flags):
+  <select name=sensitivity>{sel(SENSITIVITY_LEVELS, cfg.get('sensitivity', 'standard'))}</select></label>
+<label>Threshold (confidence to act):
+  <select name=threshold>{sel(CONFIDENCE_LEVELS.keys(), level)}</select></label>
+</fieldset>
+<fieldset><legend>Categories (checked = flagged)</legend>
+<div class=grid>{cat_boxes}</div>
+</fieldset>
+<fieldset><legend>Channel / role bindings <span class=note>(numeric IDs; blank = unset)</span></legend>
+<label>Review channel ID:
+  <input type=text name=review_channel value='{val('review_channel')}'></label>
+<label>Restricted role ID:
+  <input type=text name=restricted_role value='{val('restricted_role')}'></label>
+<label>Alert role ID (pinged on every removal):
+  <input type=text name=alert_role value='{val('alert_role')}'></label>
+<label>Excluded channel IDs <span class=note>(comma-separated)</span>:
+  <input type=text name=exempt_channels value='{_esc(exempt)}'></label>
+</fieldset>
+<button>Save settings</button>
+</form>
+<fieldset><legend>Free-tier quota</legend>
+<p><b>{used} / {FREE_SCAN_LIMIT}</b> scans used today (UTC).
+<span class=note>Premium servers are uncapped.</span></p>
+<form method=post action='/guild/quota-reset?token={_esc(token)}'>
+<input type=hidden name=guild_id value='{gid}'>
+<button>Reset today's quota</button></form>
+</fieldset>
+<h3>Recent activity (this server)</h3>
+{activity_html}"""
+
+
+def _parse_id(raw: str):
+    raw = (raw or "").strip()
+    return int(raw) if raw.isdigit() else None
 
 
 async def _admin_index(request: "web.Request") -> "web.Response":
@@ -2073,6 +2282,73 @@ async def _admin_set(request: "web.Request") -> "web.Response":
     raise web.HTTPFound(f"/?token={request.query.get('token', '')}")
 
 
+async def _admin_guild(request: "web.Request") -> "web.Response":
+    if not _admin_authed(request):
+        return web.Response(status=401, text="unauthorized")
+    gid = _parse_id(request.query.get("id", ""))
+    if gid is None:
+        raise web.HTTPFound(f"/?token={request.query.get('token', '')}")
+    return web.Response(
+        text=_guild_settings_page(request.query.get("token", ""), gid),
+        content_type="text/html",
+    )
+
+
+async def _admin_guild_save(request: "web.Request") -> "web.Response":
+    if not _admin_authed(request):
+        return web.Response(status=401, text="unauthorized")
+    token = request.query.get("token", "")
+    data = await request.post()
+    gid = _parse_id(str(data.get("guild_id", "")))
+    if gid is None:
+        raise web.HTTPFound(f"/?token={token}")
+    cfg = state.guild(gid)
+    cfg["enabled"] = "enabled" in data
+    cfg["dry_run"] = "enforce" not in data
+    if data.get("sensitivity") in SENSITIVITY_LEVELS:
+        cfg["sensitivity"] = data.get("sensitivity")
+    if data.get("threshold") in CONFIDENCE_LEVELS:
+        cfg["min_confidence"] = CONFIDENCE_LEVELS[data.get("threshold")]
+    cfg["disabled_categories"] = [c for c in CATEGORIES if f"cat_{c}" not in data]
+    cfg["review_channel"] = _parse_id(str(data.get("review_channel", "")))
+    cfg["restricted_role"] = _parse_id(str(data.get("restricted_role", "")))
+    cfg["alert_role"] = _parse_id(str(data.get("alert_role", "")))
+    cfg["exempt_channels"] = [
+        int(x) for x in re.split(r"[,\s]+", str(data.get("exempt_channels", "")))
+        if x.strip().isdigit()
+    ]
+    state.save()
+    raise web.HTTPFound(f"/guild?id={gid}&token={token}")
+
+
+async def _admin_quota_reset(request: "web.Request") -> "web.Response":
+    if not _admin_authed(request):
+        return web.Response(status=401, text="unauthorized")
+    token = request.query.get("token", "")
+    data = await request.post()
+    gid = _parse_id(str(data.get("guild_id", "")))
+    if gid is None:
+        raise web.HTTPFound(f"/?token={token}")
+    cfg = state.guild(gid)
+    cfg.update(scan_day=_today(), scan_count=0, quota_notified=False)
+    state.save()
+    raise web.HTTPFound(f"/guild?id={gid}&token={token}")
+
+
+async def _admin_activity(request: "web.Request") -> "web.Response":
+    if not _admin_authed(request):
+        return web.Response(status=401, text="unauthorized")
+    token = request.query.get("token", "")
+    records = _read_audit(200)
+    page = f"""<!doctype html><meta charset=utf-8>
+<title>Sentry — activity</title>{_ADMIN_STYLE}
+<p><a href='/?token={_esc(token)}'>← all servers</a></p>
+<h2>Recent activity (all servers)</h2>
+<p class=note>Newest first, from the current audit log ({_esc(AUDIT_LOG_PATH.name)}).</p>
+{_audit_table(records, show_guild=True)}"""
+    return web.Response(text=page, content_type="text/html")
+
+
 async def start_admin_dashboard() -> None:
     global _admin_runner
     if not ADMIN_TOKEN:
@@ -2081,6 +2357,10 @@ async def start_admin_dashboard() -> None:
     app = web.Application()
     app.router.add_get("/", _admin_index)
     app.router.add_post("/set", _admin_set)
+    app.router.add_get("/guild", _admin_guild)
+    app.router.add_post("/guild/save", _admin_guild_save)
+    app.router.add_post("/guild/quota-reset", _admin_quota_reset)
+    app.router.add_get("/activity", _admin_activity)
     host, _, port = ADMIN_BIND.partition(":")
     _admin_runner = web.AppRunner(app)
     await _admin_runner.setup()

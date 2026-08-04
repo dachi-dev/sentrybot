@@ -196,9 +196,22 @@ Sentry is gated so only allowlisted ("premium") servers get the full feature set
 The allowlist is the bot owner's, managed via `SENTRY_ALLOWLIST` (comma-separated guild
 IDs), the `/sentry allowlist` command (owner-only), or the **admin dashboard**.
 
-**Admin dashboard.** Set `SENTRY_ADMIN_TOKEN` to enable a small web UI for managing the
-allowlist (list servers, grant/revoke premium, add by ID). It binds to `127.0.0.1:8899`
-by default, so reach it over an SSH tunnel — e.g.
+**Admin dashboard.** Set `SENTRY_ADMIN_TOKEN` to enable a small web UI (owner-only) that
+manages **every server from one place** — you don't need to be in the server or use the
+slash commands:
+
+- **Overview** (`/`) — all servers with tier, member count, a **health** flag (⚠️ if a
+  server is misconfigured, e.g. enabled with no review channel), premium grant/revoke, and
+  a totals line (server count, premium count, scans today).
+- **Per-server settings** (`/guild?id=…`) — every knob a server admin can change:
+  scanning on/off, enforce vs. watch-only, sensitivity, confidence threshold, each
+  category on/off, and the review-channel / restricted-role / alert-role / excluded-channel
+  bindings (by ID). Also shows that server's free-tier quota with a **reset** button and
+  its recent moderation activity.
+- **Activity** (`/activity`) — the recent audit trail across all servers (removals, check
+  failures, dry-run flags, moderator actions), newest first.
+
+It binds to `127.0.0.1:8899` by default, so reach it over an SSH tunnel — e.g.
 `gcloud compute ssh <vm> -- -L 8899:localhost:8899`, then open
 `http://localhost:8899/?token=YOUR_TOKEN`. Set `SENTRY_ADMIN_BIND=0.0.0.0:PORT` to expose
 it publicly (token-protected), but a tunnel is safer.
