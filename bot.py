@@ -314,9 +314,11 @@ def _allowances_text(cfg: dict) -> str:
     lines = "\n".join(f"- {r}" for r in rules[:ALLOWANCE_MAX])
     return (
         "\nServer-specific allowances — this community has explicitly permitted the "
-        'following. Return "clean"/"allow" for an image whose ONLY reason to be flagged '
-        "is one of these (for example reclaimed in-group use of a slur). They never "
-        "excuse anything not listed here:\n"
+        "following, so do NOT treat any listed item as a reason to flag. Return "
+        '"allow"/"clean" only if EVERY reason you would otherwise flag the image is '
+        "covered by this list; if even one reason is not listed here, classify "
+        "normally. (For example, an allowance for a reclaimed slur does not by itself "
+        "excuse separate hateful imagery such as a blackface caricature.) Allowances:\n"
         f"{lines}\n"
     )
 
