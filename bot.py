@@ -1240,8 +1240,20 @@ def _tier_note(guild_id: int) -> str:
     )
 
 
+AD_COOLDOWN = int(os.getenv("SENTRY_AD_COOLDOWN", "3600"))  # min seconds between ads/channel
+_ad_last: dict[int, float] = {}
+
+
 async def _post_ad(channel: discord.abc.Messageable) -> None:
-    """Public 'powered by' embed dropped in the channel after a removal."""
+    """Public 'powered by' embed dropped in the channel after a removal, at most once
+    per channel every AD_COOLDOWN seconds so it advertises without flooding."""
+    now = time.time()
+    cid = getattr(channel, "id", 0)
+    if now - _ad_last.get(cid, 0.0) < AD_COOLDOWN:
+        return
+    _ad_last[cid] = now
+    for k in [k for k, t in _ad_last.items() if now - t >= AD_COOLDOWN]:
+        _ad_last.pop(k, None)  # drop expired entries to bound memory
     embed = discord.Embed(
         description=(
             "🛡️ A message was removed by **Dachi Warden** — automatic image moderation "
