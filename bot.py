@@ -460,7 +460,7 @@ class Sentry(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True  # required to see attachments
         intents.guilds = True
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, enable_debug_events=True)
         self.tree = app_commands.CommandTree(self)
         self.http_session: aiohttp.ClientSession | None = None
 
@@ -1024,10 +1024,16 @@ async def _sync_commands_to_guilds():
 
 
 @bot.event
+async def on_socket_raw_receive(msg):
+    if isinstance(msg, str) and '"INTERACTION_CREATE"' in msg:
+        log.info("DIAG raw INTERACTION_CREATE arrived on the gateway socket")
+
+
+@bot.event
 async def on_interaction(interaction: discord.Interaction):
     name = (interaction.data or {}).get("name") if interaction.data else None
     log.info(
-        "DIAG interaction received: type=%s name=%s guild=%s user=%s",
+        "DIAG interaction dispatched: type=%s name=%s guild=%s user=%s",
         interaction.type, name, interaction.guild_id, interaction.user.id,
     )
 
