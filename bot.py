@@ -1011,17 +1011,16 @@ _synced_once = False
 
 
 async def _sync_commands_to_guilds():
-    """Guild-sync so commands appear/update instantly (global sync can lag up to an
-    hour) and clear stale global copies to avoid duplicates."""
+    """Register commands both globally (standard, works in every guild) and per-guild
+    (propagates instantly), so a client gets a valid command set either way."""
     try:
+        await bot.tree.sync()  # global
         for guild in bot.guilds:
             bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()  # push empty global set to remove stale global commands
-        log.info("commands guild-synced to %d guild(s)", len(bot.guilds))
+            await bot.tree.sync(guild=guild)  # instant for this guild
+        log.info("commands synced (global + %d guild)", len(bot.guilds))
     except Exception:
-        log.exception("guild command sync failed")
+        log.exception("command sync failed")
 
 
 @bot.event
