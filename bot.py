@@ -806,10 +806,14 @@ async def _fetch_image_bytes(url: str) -> bytes | None:
             ctype = resp.headers.get("Content-Type", "")
             if ctype and not ctype.startswith("image/"):
                 return None
-            data = await resp.content.read(API_IMAGE_BYTE_LIMIT + 1)
-            if not data or len(data) > API_IMAGE_BYTE_LIMIT:
-                return None
-            return data
+            # read() with a size returns only the first buffered chunk in aiohttp,
+            # which truncates larger images; accumulate the full body up to the cap.
+            data = b""
+            async for chunk in resp.content.iter_chunked(65536):
+                data += chunk
+                if len(data) > API_IMAGE_BYTE_LIMIT:
+                    return None  # oversize
+            return data or None
     except Exception:
         return None
 
