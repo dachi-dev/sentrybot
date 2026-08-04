@@ -277,7 +277,12 @@ async def main():
     sentry._embed_image_urls = lambda m: [("embed0.img", "http://x/e.png")]
     sentry._fetch_image_bytes = _fake_fetch
     await sentry._scan_created(msg, cfg)
-    cases = sum(1 for e in EVENTS if e[0] == "review_post")
+    cases = sum(
+        1
+        for e in EVENTS
+        if e[0] == "review_post"
+        and any(f.name == "User" for f in e[1]["embed"].fields)  # exclude the ad embed
+    )
     print("\n=== attachment + embed both flagged ===")
     print(f"  cases opened (want 1): {cases}")
 

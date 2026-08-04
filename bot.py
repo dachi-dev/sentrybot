@@ -187,6 +187,12 @@ class State:
         s = str(guild_id)
         return s in ALLOWLIST_ENV or s in self.data.get("__allowlist__", [])
 
+    def is_env_allowed(self, guild_id: int) -> bool:
+        return str(guild_id) in ALLOWLIST_ENV
+
+    def is_state_allowed(self, guild_id: int) -> bool:
+        return str(guild_id) in self.data.get("__allowlist__", [])
+
     def set_allowed(self, guild_id: int, on: bool) -> None:
         lst = self.data.setdefault("__allowlist__", [])
         s = str(guild_id)
@@ -1204,7 +1210,8 @@ async def _log_dry_flag(message: discord.Message, flagged: list, cfg: dict):
     jump = getattr(message, "jump_url", None)
     if jump:
         embed.add_field(name="Message", value=f"[jump to it]({jump})", inline=False)
-    embed.set_footer(text="Dry run: image left up. Turn dry run off to enforce.")
+    embed.add_field(name="Plan", value=_tier_note(message.guild.id), inline=False)
+    embed.set_footer(text="Watch-only: image left up. Upgrade to enforce.")
     files = [
         discord.File(io.BytesIO(raw), filename=f"SPOILER_{name}")
         for name, raw, _ in flagged[:5]
@@ -1215,6 +1222,38 @@ async def _log_dry_flag(message: discord.Message, flagged: list, cfg: dict):
         )
     except discord.Forbidden:
         log.warning("cannot post dry-run notice to review channel")
+
+
+def _tier_note(guild_id: int) -> str:
+    """A short free-vs-premium blurb for the review channel."""
+    if _premium(guild_id):
+        return (
+            "**Premium** — all categories + enforcement enabled. "
+            "Questions? DM **zukothedog** on Discord."
+        )
+    return (
+        f"**Free tier** — only `sexual_nudity` + `minor_sexual`, watch-only (nothing "
+        f"removed except CSAM), and {FREE_SCAN_LIMIT} scans/day.\n"
+        "**Premium** unlocks every category (gore, hate symbols, doxxing, self-harm, "
+        "drugs, scam/spam…), lets you actually remove flagged images, and lifts the "
+        "scan cap. DM **zukothedog** on Discord to upgrade."
+    )
+
+
+async def _post_ad(channel: discord.abc.Messageable) -> None:
+    """Public 'powered by' embed dropped in the channel after a removal."""
+    embed = discord.Embed(
+        description=(
+            "🛡️ A message was removed by **Dachi Warden** — automatic image moderation "
+            "for Discord.\nWant it on your server? DM **zukothedog** on Discord — "
+            "free & premium tiers available."
+        ),
+        colour=discord.Colour.blurple(),
+    )
+    try:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        pass
 
 
 async def _log_quota_reached(message: discord.Message, cfg: dict):
@@ -1428,6 +1467,8 @@ async def _run_moderation(
         pass
 
     await open_case(message, flagged, worst, restricted, critical)
+    if not critical:  # never advertise right after removing suspected CSAM
+        await _post_ad(channel)
     return True
 
 
@@ -1466,6 +1507,7 @@ async def open_case(
         value="Image permissions revoked" if restricted else "None applied",
         inline=True,
     )
+    embed.add_field(name="Plan", value=_tier_note(message.guild.id), inline=False)
     if message.content:
         embed.add_field(
             name="Message text", value=message.content[:500], inline=False
@@ -1936,19 +1978,26 @@ def _admin_authed(request: "web.Request") -> bool:
 
 def _admin_page(token: str) -> str:
     in_guild = {g.id: g for g in bot.guilds}
+
+    def action_cell(gid: int) -> str:
+        if state.is_env_allowed(gid):
+            return "<em>via SENTRY_ALLOWLIST</em>"
+        nxt = "remove" if state.is_state_allowed(gid) else "add"
+        label = "Revoke" if nxt == "remove" else "Grant premium"
+        return (
+            f"<form method=post action='/set?token={_esc(token)}'>"
+            f"<input type=hidden name=guild_id value='{gid}'>"
+            f"<input type=hidden name=action value='{nxt}'>"
+            f"<button>{label}</button></form>"
+        )
+
     rows = ""
     for g in sorted(bot.guilds, key=lambda x: (x.name or "").lower()):
-        premium = state.is_allowed(g.id)
-        nxt = "remove" if premium else "add"
-        label = "Revoke" if premium else "Grant premium"
-        badge = "✅ premium" if premium else "free"
+        badge = "✅ premium" if state.is_allowed(g.id) else "free"
         rows += (
             f"<tr><td>{_esc(g.name)}</td><td><code>{g.id}</code></td>"
             f"<td>{g.member_count or '?'}</td><td>{badge}</td>"
-            f"<td><form method=post action='/set?token={_esc(token)}'>"
-            f"<input type=hidden name=guild_id value='{g.id}'>"
-            f"<input type=hidden name=action value='{nxt}'>"
-            f"<button>{label}</button></form></td></tr>"
+            f"<td>{action_cell(g.id)}</td></tr>"
         )
     # allowlisted ids the bot isn't currently in
     extra = ""
@@ -1956,11 +2005,7 @@ def _admin_page(token: str) -> str:
         if int(gid) not in in_guild:
             extra += (
                 f"<tr><td><em>not joined</em></td><td><code>{_esc(gid)}</code></td>"
-                f"<td>—</td><td>✅ premium</td>"
-                f"<td><form method=post action='/set?token={_esc(token)}'>"
-                f"<input type=hidden name=guild_id value='{_esc(gid)}'>"
-                f"<input type=hidden name=action value='remove'>"
-                f"<button>Revoke</button></form></td></tr>"
+                f"<td>—</td><td>✅ premium</td><td>{action_cell(int(gid))}</td></tr>"
             )
     return f"""<!doctype html><meta charset=utf-8>
 <title>Sentry admin</title>
