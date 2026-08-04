@@ -36,6 +36,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry setup` | Choose the review channel (warns if @everyone can read it) |
 | `/sentry sensitivity` | `relaxed` / `standard` / `strict` (what Claude flags) |
 | `/sentry threshold` | `low` / `medium` / `high` — confidence needed to quarantine |
+| `/sentry category` | Turn a category on/off (e.g. disable `harassment_doxxing`); CSAM can't be disabled |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |
@@ -169,6 +170,10 @@ reporting links (Discord T&S, NCMEC). Report the account; do not forward the con
   category, confidence, reason, and SHA-256 — so you can reconstruct exactly what
   happened and why **even if the bot is kicked from the server** and the Discord-side
   cases become inaccessible. Read it with e.g. `jq . audit.jsonl`.
+- **Blocked-image archive (opt-in).** Set `SENTRY_ARCHIVE_BLOCKED=N` to save each blocked
+  image's bytes to `blocked/<sha256>.<ext>` (next to the state file) for `N` days, so you
+  can eyeball false positives directly. Off by default, and **suspected CSAM is never
+  written to disk**. The filename's sha256 matches the audit log, so you can cross-ref.
 - Review buttons are persistent — they keep working after a restart.
 - One process, asyncio semaphore capping concurrent API calls at 4. An image-spam raid
   queues rather than fanning out, which lengthens the visibility window under load.

@@ -25,6 +25,7 @@ import logging
 import logging.handlers
 import os
 import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,14 @@ def audit(event: str, **fields: Any) -> None:
         log.exception("audit logging failed")
 
 
+# Optional local archive of blocked image bytes, for reviewing false positives. OFF
+# unless SENTRY_ARCHIVE_BLOCKED is a positive number of retention days. Files are named
+# by sha256 (matching the audit log), live next to the state file outside the git tree,
+# and suspected CSAM is NEVER written to disk.
+ARCHIVE_BLOCKED_DAYS = int(os.getenv("SENTRY_ARCHIVE_BLOCKED", "0"))
+ARCHIVE_DIR = STATE_PATH.parent / "blocked"
+
+
 # --------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------
@@ -145,6 +154,7 @@ class State:
                 "blocked_hashes": {},  # sha256 -> verdict; reposts skip Claude
                 "approved_posts": {},  # sha256 -> [[channel_id, message_id]] reposts
                 "min_confidence": DEFAULT_MIN_CONFIDENCE,  # quarantine threshold
+                "disabled_categories": [],  # categories a mod turned off
             },
         )
 
@@ -1027,18 +1037,45 @@ async def _scan_embeds(message: discord.Message, cfg: dict):
     await _run_moderation(message, payloads, cfg)
 
 
-def _should_quarantine(verdict: dict, min_conf: float) -> bool:
+def _should_quarantine(verdict: dict, min_conf: float, disabled=()) -> bool:
     """Whether a verdict warrants removing the image: a failed check never acts,
-    suspected CSAM always acts, otherwise the confidence must clear the threshold."""
+    suspected CSAM always acts, a disabled category never acts, otherwise the
+    confidence must clear the threshold."""
     if verdict.get("verdict") != "block" or verdict.get("error"):
         return False
-    if verdict.get("category") == "minor_sexual":
-        return True
+    category = verdict.get("category")
+    if category == "minor_sexual":
+        return True  # CSAM cannot be disabled
+    if category in disabled:
+        return False  # moderator turned this category off
     try:
         confidence = float(verdict.get("confidence", 0))
     except (TypeError, ValueError):
         confidence = 0.0
     return confidence >= min_conf
+
+
+def _archive_blocked(flagged: list, critical: bool) -> None:
+    """Optionally save blocked image bytes to ARCHIVE_DIR for later review. No-op
+    unless SENTRY_ARCHIVE_BLOCKED>0. NEVER writes suspected CSAM to disk. Never raises."""
+    if ARCHIVE_BLOCKED_DAYS <= 0 or critical:
+        return
+    try:
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - ARCHIVE_BLOCKED_DAYS * 86400
+        for old in ARCHIVE_DIR.iterdir():  # prune expired archives
+            try:
+                if old.is_file() and old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+        for _, raw, v in flagged:
+            if v.get("category") == "minor_sexual":
+                continue  # never write CSAM to disk
+            ext = (_sniff_mime(raw) or "image/bin").split("/")[1]
+            (ARCHIVE_DIR / f"{hashlib.sha256(raw).hexdigest()}.{ext}").write_bytes(raw)
+    except Exception:
+        log.exception("failed to archive blocked image")
 
 
 async def _log_check_failure(message: discord.Message, errored: list, cfg: dict):
@@ -1141,13 +1178,14 @@ async def _run_moderation(
                         del lst[: len(lst) - 50]
         state.save()
 
-    # Quarantine a block only if it's confident enough (a failed check never acts,
-    # suspected CSAM always does — see _should_quarantine).
+    # Quarantine a block only if it's confident enough, its category is enabled, and
+    # it isn't a failed check (suspected CSAM always acts — see _should_quarantine).
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
+    disabled = set(cfg.get("disabled_categories", []))
     flagged = [
         (name, raw, v)
         for (name, _, raw), v in zip(payloads, results)
-        if _should_quarantine(v, min_conf)
+        if _should_quarantine(v, min_conf, disabled)
     ]
     if not flagged:
         # Nothing to remove. If a check failed outright, surface it to moderators so
@@ -1184,6 +1222,7 @@ async def _run_moderation(
     worst = max(flagged, key=lambda f: f[2].get("confidence", 0))[2]
     critical = any(f[2].get("category") == "minor_sexual" for f in flagged)
     restricted = await restrict(author, f"flagged: {worst.get('category')}")
+    _archive_blocked(flagged, critical)
 
     for name, raw, v in flagged:
         audit(
@@ -1394,6 +1433,43 @@ async def threshold_cmd(
     )
 
 
+@mod.command(name="category", description="Turn a moderation category on or off")
+@app_commands.describe(category="Which category", action="Turn it on or off")
+@app_commands.choices(
+    category=[
+        app_commands.Choice(name="sexual_nudity", value="sexual_nudity"),
+        app_commands.Choice(name="gore", value="gore"),
+        app_commands.Choice(name="hate_symbol", value="hate_symbol"),
+        app_commands.Choice(name="violence_threat", value="violence_threat"),
+        app_commands.Choice(name="harassment_doxxing", value="harassment_doxxing"),
+        app_commands.Choice(name="self_harm", value="self_harm"),
+        app_commands.Choice(name="drugs", value="drugs"),
+        app_commands.Choice(name="scam_spam", value="scam_spam"),
+    ],
+    action=[
+        app_commands.Choice(name="off — ignore images flagged as this", value="off"),
+        app_commands.Choice(name="on — flag images in this category", value="on"),
+    ],
+)
+async def category_cmd(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+    action: app_commands.Choice[str],
+):
+    cfg = state.guild(interaction.guild.id)
+    disabled = cfg.setdefault("disabled_categories", [])
+    if action.value == "off":
+        if category.value not in disabled:
+            disabled.append(category.value)
+        msg = f"**{category.value}** is now **off** — images flagged as this are ignored."
+    else:
+        if category.value in disabled:
+            disabled.remove(category.value)
+        msg = f"**{category.value}** is now **on**."
+    state.save()
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 @mod.command(name="exclude", description="Exclude a channel from scanning (or re-include it)")
 @app_commands.describe(
     channel="Channel to exclude from moderation",
@@ -1491,6 +1567,12 @@ async def status_cmd(interaction: discord.Interaction):
         f"{len(cfg.get('blocked_hashes', {}))} blocked",
         inline=True,
     )
+    disabled = cfg.get("disabled_categories", [])
+    embed.add_field(
+        name="Disabled categories",
+        value=", ".join(disabled) if disabled else "none (all on)",
+        inline=False,
+    )
     missing = _missing_perms(interaction.guild)
     embed.add_field(
         name="Permissions",
@@ -1529,7 +1611,8 @@ async def post_cmd(
     )
 
     min_conf = cfg.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
-    if _should_quarantine(verdict, min_conf):
+    disabled = set(cfg.get("disabled_categories", []))
+    if _should_quarantine(verdict, min_conf, disabled):
         restricted = await restrict(
             interaction.user, f"flagged via /post: {verdict.get('category')}"
         )

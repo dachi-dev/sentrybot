@@ -298,6 +298,25 @@ async def main():
     print("\n=== confidence threshold (block 0.50 vs threshold 0.90) ===")
     print(f"  message deleted (want No): {msg.deleted}")
 
+    # disabled category: a flagged category that's turned off is NOT quarantined
+    EVENTS.clear()
+    CALLS.clear()
+    sentry.verdict_cache.clear()
+    NEXT_VERDICT.update(payload=gore)  # gore, but gore is disabled below
+    NEXT_VERDICT["raise"] = False
+    guild = FakeGuild()
+    cfg = sentry.state.guild(guild.id)
+    cfg["review_channel"] = 77
+    cfg["restricted_role"] = 999
+    cfg["approved_hashes"] = []
+    cfg["blocked_hashes"] = {}
+    cfg["disabled_categories"] = ["gore"]
+    att = FakeAttachment("goredisabled.png", (171, 21, 21))
+    msg = FakeMessage(guild, FakeChannel(10, "general"), [att], "gore but disabled")
+    await sentry.process(msg, [att], cfg)
+    print("\n=== disabled category (gore turned off) ===")
+    print(f"  message deleted (want No): {msg.deleted}")
+
     # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
     _hp = sentry.HAS_PIL
     sentry.HAS_PIL = False
