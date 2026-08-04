@@ -175,6 +175,7 @@ _GUILD_DEFAULTS: dict[str, Any] = {
     "quota_notified": False,  # posted the "quota reached" notice yet
     "alert_role": None,  # role pinged on every removal
     "allowances": list,  # community-specific exceptions injected into the prompt
+    "exempt_reviewers": True,  # skip anyone who can see the review channel (staff)
 }
 
 
@@ -1123,7 +1124,9 @@ def _guild_scans(message: discord.Message, cfg: dict) -> bool:
         return False
     if message.channel.id == cfg.get("review_channel"):
         return False
-    if _is_reviewer(message.guild, message.author, cfg):
+    if cfg.get("exempt_reviewers", True) and _is_reviewer(
+        message.guild, message.author, cfg
+    ):
         return False  # staff (can see the review channel) are exempt from moderation
     return True
 
@@ -1820,6 +1823,31 @@ async def dryrun_cmd(
     )
 
 
+@mod.command(
+    name="staffbypass",
+    description="Whether people who can see the review channel are exempt from moderation",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="on — staff are not moderated (default)", value="on"),
+        app_commands.Choice(name="off — moderate everyone, incl. staff (for testing)", value="off"),
+    ]
+)
+async def staffbypass_cmd(
+    interaction: discord.Interaction, mode: app_commands.Choice[str]
+):
+    cfg = state.guild(interaction.guild.id)
+    cfg["exempt_reviewers"] = mode.value == "on"
+    state.save()
+    await interaction.response.send_message(
+        "Staff bypass is **ON** — anyone who can see the review channel is skipped."
+        if cfg["exempt_reviewers"]
+        else "Staff bypass is **OFF** — **everyone is moderated, including staff.** "
+        "Handy for testing; turn it back on when you're done.",
+        ephemeral=True,
+    )
+
+
 @mod.command(name="allowlist", description="(bot owner only) Grant/revoke a server's premium access")
 @app_commands.describe(guild_id="The server ID", action="Add or remove premium access")
 @app_commands.choices(
@@ -2009,7 +2037,9 @@ async def post_cmd(
     raw = await image.read()
 
     # Staff (anyone who can see the review channel) are exempt — post without scanning.
-    if _is_reviewer(interaction.guild, interaction.user, cfg):
+    if cfg.get("exempt_reviewers", True) and _is_reviewer(
+        interaction.guild, interaction.user, cfg
+    ):
         body = f"{interaction.user.mention}:" + (f" {text}" if text else "")
         await interaction.channel.send(
             content=body,
@@ -2375,6 +2405,8 @@ def _guild_settings_page(token: str, gid: int) -> str:
   Scanning enabled (server-wide)</label>
 <label><input type=checkbox name=enforce{checked(not cfg.get('dry_run', DEFAULT_DRY_RUN))}>
   Enforce — remove flagged images (unchecked = watch-only / dry run)</label>
+<label><input type=checkbox name=exempt_reviewers{checked(cfg.get('exempt_reviewers', True))}>
+  Staff bypass — don't moderate anyone who can see the review channel (uncheck to test on staff)</label>
 <label>Sensitivity (what Claude flags):
   <select name=sensitivity>{sel(SENSITIVITY_LEVELS, cfg.get('sensitivity', 'standard'))}</select></label>
 <label>Threshold (confidence to act):
@@ -2458,6 +2490,7 @@ async def _admin_guild_save(request: "web.Request") -> "web.Response":
     cfg = state.guild(gid)
     cfg["enabled"] = "enabled" in data
     cfg["dry_run"] = "enforce" not in data
+    cfg["exempt_reviewers"] = "exempt_reviewers" in data
     if data.get("sensitivity") in SENSITIVITY_LEVELS:
         cfg["sensitivity"] = data.get("sensitivity")
     if data.get("threshold") in CONFIDENCE_LEVELS:

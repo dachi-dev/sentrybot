@@ -42,6 +42,7 @@ edit history. Single file, no database, ~800 input tokens per image.
 | `/sentry alertrole` | Role to ping on **every removal** |
 | `/sentry allowlist` | **(bot owner only)** grant/revoke a server's premium access by ID |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
+| `/sentry staffbypass` | `on`/`off` — whether review-channel viewers (staff) are exempt from moderation |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |
 | `/sentry restrict` / `unrestrict` | Manual permission control |
@@ -198,14 +199,16 @@ Three buttons:
   scanning multiplies the per-GIF cost by up to `SENTRY_GIF_FRAMES`; lower it to trade
   coverage for cost. Embed/link scanning depends on the bot reaching the image URL and
   fails open (an unreachable link is not flagged).
-- **Staff are exempt.** Anyone who can **see the review channel** is treated as a
-  moderator and skipped entirely — their images are never scanned, removed, or sent to
-  Claude (this also covers `/post`). "Can see it" is computed from that member's real
-  permissions in the review channel, so it includes Administrators and the server owner
-  (who can view every channel). One consequence: **if the review channel is readable by
-  `@everyone`, everyone is exempt** and moderation effectively stops — keep it mod-only
-  (the `/sentry setup` command warns when it isn't). With no review channel set, nobody
-  is exempt.
+- **Staff are exempt (toggle).** By default, anyone who can **see the review channel** is
+  treated as a moderator and skipped entirely — their images are never scanned, removed, or
+  sent to Claude (this also covers `/post`). "Can see it" is computed from that member's
+  real permissions in the review channel, so it includes Administrators and the server
+  owner (who can view every channel). Turn this off with `/sentry staffbypass off` (or the
+  **Staff bypass** checkbox on the dashboard) to **moderate everyone, including staff** —
+  useful for testing the bot on your own account; turn it back on when done. One
+  consequence while it's on: **if the review channel is readable by `@everyone`, everyone
+  is exempt** and moderation effectively stops — keep it mod-only (the `/sentry setup`
+  command warns when it isn't). With no review channel set, nobody is exempt.
 
 ## Tiers
 
