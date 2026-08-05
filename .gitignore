@@ -5,6 +5,9 @@
 # Runtime state
 sentry_state.json
 sentry_state.tmp
+sentry_state.db
+sentry_state.db-wal
+sentry_state.db-shm
 audit.jsonl
 audit.jsonl.*
 blocked/

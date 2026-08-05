@@ -26,6 +26,7 @@ import logging
 import logging.handlers
 import os
 import re
+import sqlite3
 import time
 from collections import OrderedDict
 from html import escape as _esc
@@ -179,17 +180,62 @@ _GUILD_DEFAULTS: dict[str, Any] = {
 }
 
 
+STATE_FLUSH_DELAY = float(os.getenv("SENTRY_FLUSH_DELAY", "2.0"))  # debounce seconds
+
+
 class State:
-    """Tiny JSON-backed per-guild config store."""
+    """Per-guild config store, backed by SQLite (a key→JSON row per guild plus the
+    reserved ``__allowlist__`` key). The whole store is mirrored in memory and
+    mutated in place exactly as before; ``save()`` no longer rewrites everything
+    synchronously — it marks the store dirty and schedules a **debounced** flush
+    that writes only the keys whose value actually changed. This turns the old
+    per-scan full-file rewrite into at most one small, changed-rows-only write
+    every ``STATE_FLUSH_DELAY`` seconds, which is what lets it scale to many
+    servers. The legacy JSON file is migrated in once, then left as a backup."""
 
     def __init__(self, path: Path):
-        self.path = path
+        self.path = path  # legacy JSON path — used once for migration, then a backup
+        self.db_path = path.with_suffix(".db")
         self.data: dict[str, dict[str, Any]] = {}
-        if path.exists():
+        self._written: dict[str, int] = {}  # key -> hash of last-persisted JSON
+        self._dirty = False
+        self._flush_handle: asyncio.TimerHandle | None = None
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(self.db_path)
+        self._db.execute("PRAGMA journal_mode=WAL")   # concurrent reads, cheap writes
+        self._db.execute("PRAGMA synchronous=NORMAL")  # durable enough, far faster
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self._db.commit()
+        self._load()
+        if not self.data and path.exists():
+            self._migrate_json()
+
+    def _load(self) -> None:
+        for key, blob in self._db.execute("SELECT key, value FROM kv"):
             try:
-                self.data = json.loads(path.read_text())
-            except Exception:
-                log.exception("state file unreadable, starting fresh")
+                self.data[key] = json.loads(blob)
+                self._written[key] = hash(blob)
+            except ValueError:
+                log.warning("skipping unreadable state row for %s", key)
+
+    def _migrate_json(self) -> None:
+        try:
+            data = json.loads(self.path.read_text())
+        except Exception:
+            log.exception("legacy state file unreadable; starting fresh")
+            return
+        if not isinstance(data, dict):
+            return
+        self.data = data
+        self._dirty = True
+        self._flush()  # persist everything into the DB now (no event loop needed)
+        log.info(
+            "migrated %d keys from %s into %s (JSON kept as backup)",
+            len(data), self.path, self.db_path,
+        )
 
     def guild(self, guild_id: int) -> dict[str, Any]:
         cfg = self.data.setdefault(str(guild_id), {})
@@ -225,9 +271,57 @@ class State:
         return list(self.data.get("__allowlist__", [])) + sorted(ALLOWLIST_ENV)
 
     def save(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2))
-        tmp.replace(self.path)
+        """Mark the store dirty and schedule a debounced flush. Callers keep using
+        this exactly as before — it just no longer blocks on a full rewrite."""
+        self._dirty = True
+        if self._flush_handle is not None:
+            return  # a flush is already scheduled
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._flush()  # no loop yet (startup/migration/tests) — write now
+            return
+        self._flush_handle = loop.call_later(STATE_FLUSH_DELAY, self._on_timer)
+
+    def _on_timer(self) -> None:
+        self._flush_handle = None
+        self._flush()
+
+    def _flush(self) -> None:
+        """Write only the keys whose serialized value changed since the last flush."""
+        if not self._dirty:
+            return
+        self._dirty = False
+        rows = []
+        for key, value in self.data.items():
+            blob = json.dumps(value)
+            if self._written.get(key) != hash(blob):
+                rows.append((key, blob))
+        if not rows:
+            return
+        try:
+            with self._db:
+                self._db.executemany(
+                    "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", rows
+                )
+        except sqlite3.Error:
+            log.exception("state flush failed; will retry on next save")
+            self._dirty = True
+            return
+        for key, blob in rows:
+            self._written[key] = hash(blob)
+
+    def flush(self) -> None:
+        """Force an immediate synchronous write. Call on shutdown so a pending
+        debounced flush isn't lost."""
+        if self._flush_handle is not None:
+            self._flush_handle.cancel()
+            self._flush_handle = None
+        self._flush()
+
+    def close(self) -> None:
+        self.flush()
+        self._db.close()
 
 
 state = State(STATE_PATH)
@@ -536,6 +630,7 @@ class Sentry(discord.Client):
         # Commands are synced per-guild in on_ready (instant; avoids global lag).
 
     async def close(self):
+        state.flush()  # persist any debounced writes before we go down
         await stop_admin_dashboard()
         if self.http_session:
             await self.http_session.close()
@@ -2569,4 +2664,7 @@ async def stop_admin_dashboard() -> None:
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    try:
+        bot.run(DISCORD_TOKEN, log_handler=None)
+    finally:
+        state.close()  # final flush + close the DB even on abnormal exit

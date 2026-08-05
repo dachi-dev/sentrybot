@@ -189,7 +189,7 @@ Three buttons:
   confident* a flag must be.
 - **Cost:** one Haiku call per image at ~800 input tokens, ~50 output. Identical
   re-uploads cost nothing: an in-memory cache covers the current session, and moderator
-  decisions (both approvals and disapprovals) **persist to `sentry_state.json`**, so a
+  decisions (both approvals and disapprovals) **persist to the state DB**, so a
   reposted image that was already approved or already rejected never calls Claude again,
   even across restarts. Rates: <https://claude.com/pricing>
 - **Lower `SENTRY_MAX_EDGE` to 512** to roughly halve tokens and shave latency; obvious
@@ -246,8 +246,12 @@ it publicly (token-protected), but a tunnel is safer.
 
 ## Operational notes
 
-- State lives in `sentry_state.json`. Back it up; both values are recoverable by
-  re-running `/sentry setup`.
+- **State** lives in a **SQLite database** (`sentry_state.db`, WAL mode) next to the path
+  named by `SENTRY_STATE`. Writes are debounced (default 2 s, `SENTRY_FLUSH_DELAY`) and
+  only changed guilds are written — so a busy fleet of servers never triggers a full
+  rewrite per scan. Back up the `.db` file; core settings are also recoverable by
+  re-running `/sentry setup`. A pre-existing `sentry_state.json` is migrated in once on
+  first start and then kept as a backup.
 - **Audit log.** Every removal, check-failure, and moderator action is appended as one
   JSON object per line to `audit.jsonl` (next to the state file; override with
   `SENTRY_AUDIT_LOG`, rotated at 5 MB × 5). It records the user, channel, message id,
