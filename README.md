@@ -265,3 +265,34 @@ it publicly (token-protected), but a tunnel is safer.
 - Review buttons are persistent — they keep working after a restart.
 - One process, asyncio semaphore capping concurrent API calls at 4. An image-spam raid
   queues rather than fanning out, which lengthens the visibility window under load.
+
+## Scaling
+
+The bot is a single process. Two changes already remove the hard ceilings that would
+otherwise cap it at a handful of servers, so **one modest VM comfortably serves several
+hundred active servers**:
+
+- **State is SQLite (WAL) with debounced, changed-only writes** — no more full-file
+  rewrite per scan (see Operational notes).
+- **Commands sync globally, only on change** — one API call registers commands for every
+  guild, and unchanged restarts make zero command calls. Cost is independent of guild
+  count. Bump `COMMANDS_VERSION` (or just edit a command — the structural fingerprint
+  catches it) to force the next start to re-sync.
+
+### Future work (only needed beyond one busy box)
+
+- **Prompt-cache the system prompt** — the ~700-token classifier prompt is re-sent on
+  every scan. Caching it would cut per-scan input cost to ~0.1× on repeats and reduce
+  latency. Highest-leverage remaining cost lever.
+- **Raise `SENTRY_CONCURRENCY`** (currently 4) as your Anthropic rate limits allow — the
+  global semaphore is what lengthens the visibility window under a raid.
+- **Perceptual-hash pre-filter** — near-duplicate images short-circuit without a Claude
+  call, not just exact-byte reposts.
+- **Horizontal split** — move classification onto a queue (Redis/RabbitMQ) with a stateless
+  worker pool, back the verdict/hash caches with **Redis** (they're per-process today), and
+  point the dashboard at the DB instead of parsing the audit file. This is what lets you
+  run multiple processes/shards without them fighting over state.
+- **Sharding** — Discord requires it at **2,500 guilds**; switch `discord.Client` →
+  `AutoShardedClient` when you approach it (well beyond "hundreds").
+- **Move off the free e2-micro** — 1 shared vCPU / ~1 GB RAM is the practical compute floor;
+  Pillow decode/resize and in-memory caches want more headroom under real load.
