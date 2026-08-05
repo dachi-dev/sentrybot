@@ -2166,10 +2166,12 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
     )
 
 
-# --- /sentry ask: a lightweight question-answering helper -----------------
+# --- /ask: a lightweight question-answering helper (open to everyone) ------
+# Top-level (not under /sentry) so it isn't gated by the group's Manage-Server
+# default permission — anyone in the server can use it.
 ASK_SYSTEM_BASE = (
-    "You are Dachi Warden, a Discord moderation bot answering a question from a server "
-    "moderator. Be helpful, direct, and accurate. Write plain text suitable for a Discord "
+    "You are Dachi Warden, a helpful assistant in a Discord server answering a member's "
+    "question. Be helpful, direct, and accurate. Write plain text suitable for a Discord "
     "message — no large headings. If you don't know or can't help, say so briefly."
 )
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
@@ -2181,7 +2183,8 @@ ASK_COOLDOWN = 8.0  # seconds between asks per user
 _ask_last: dict[int, float] = {}
 
 
-@mod.command(name="ask", description="Ask a question and get an answer")
+@bot.tree.command(name="ask", description="Ask a question and get an answer")
+@app_commands.guild_only()
 @app_commands.describe(
     question="What do you want to ask?",
     length="How long the answer should be (default: short)",
