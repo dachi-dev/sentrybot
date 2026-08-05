@@ -109,6 +109,12 @@ OWNER_ID = int(os.getenv("SENTRY_OWNER_ID", "0"))  # 0 => resolved from the app 
 MAX_CONCURRENT_CHECKS = int(os.getenv("SENTRY_CONCURRENCY", "8"))
 VERDICT_CACHE_SIZE = 512
 
+# Perceptual re-block: a newly posted image within this Hamming distance (of 64) of a
+# previously blocked image is re-blocked from cache without calling Claude — catches
+# re-compressed/resized/lightly-edited reposts of banned content, not just exact bytes.
+# Lower = stricter (fewer false matches). Set < 0 to disable (exact-hash only).
+PHASH_DISTANCE = int(os.getenv("SENTRY_PHASH_DISTANCE", "5"))
+
 SUPPORTED_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 logging.basicConfig(
@@ -492,6 +498,40 @@ def _extract_frames(raw: bytes, mime: str) -> list[tuple[str, str]]:
     if media in SUPPORTED_MIME and len(raw) <= API_IMAGE_BYTE_LIMIT * 0.7:
         return [(base64.standard_b64encode(raw).decode(), media)]
     return []
+
+
+_DHASH_SIZE = 8  # -> a 64-bit difference hash
+
+
+def _dhash(raw: bytes) -> int | None:
+    """64-bit perceptual difference-hash: visually similar images have a small Hamming
+    distance even when their bytes differ. Pure Pillow; None if undecodable."""
+    if not HAS_PIL:
+        return None
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img.draft("L", (_DHASH_SIZE * 4, _DHASH_SIZE * 4))  # fast JPEG downscale hint
+            small = img.convert("L").resize((_DHASH_SIZE + 1, _DHASH_SIZE), Image.LANCZOS)
+        px = small.load()
+        bits = 0
+        for y in range(_DHASH_SIZE):
+            for x in range(_DHASH_SIZE):
+                bits = (bits << 1) | (1 if px[x, y] > px[x + 1, y] else 0)
+        # 0 / all-ones are degenerate (flat or perfectly-graded images); treat as "no
+        # useful hash" so unrelated low-detail images don't all collide.
+        return bits if bits not in (0, (1 << (_DHASH_SIZE * _DHASH_SIZE)) - 1) else None
+    except Exception:
+        return None
+
+
+def _nearest_blocked(phash: int, blocked: dict, max_distance: int) -> dict | None:
+    """First blocked entry whose stored perceptual hash is within max_distance of
+    phash, or None. Entries without a stored phash (older blocks) are skipped."""
+    for entry in blocked.values():
+        stored = entry.get("phash")
+        if stored is not None and (phash ^ stored).bit_count() <= max_distance:
+            return entry
+    return None
 
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
@@ -1604,6 +1644,21 @@ async def _run_moderation(
                 "reason": v.get("reason", "previously flagged"),
                 "error": False,
             }
+        # Perceptual re-block: a near-duplicate of a known-bad image (re-compressed,
+        # resized, lightly edited) is re-blocked from cache — no Claude call, and it
+        # resists trivial evasion. Only re-uses BLOCK verdicts, never ALLOW.
+        if PHASH_DISTANCE >= 0 and blocked:
+            ph = await asyncio.to_thread(_dhash, raw)
+            if ph is not None:
+                match = _nearest_blocked(ph, blocked, PHASH_DISTANCE)
+                if match is not None:
+                    return {
+                        "verdict": "block",
+                        "category": match.get("category", "blocked"),
+                        "confidence": match.get("confidence", 1.0),
+                        "reason": match.get("reason", "near-duplicate of a blocked image"),
+                        "error": False,
+                    }
         fresh += 1
         return await classify(raw, mime, sensitivity, allowances)
 
@@ -1777,11 +1832,16 @@ async def open_case(
             continue
         digest = hashlib.sha256(raw).hexdigest()
         if digest not in blocked:
-            blocked[digest] = {
+            entry = {
                 "category": v.get("category"),
                 "confidence": v.get("confidence", 0.0),
                 "reason": v.get("reason", ""),
             }
+            if PHASH_DISTANCE >= 0:
+                ph = await asyncio.to_thread(_dhash, raw)
+                if ph is not None:
+                    entry["phash"] = ph  # enables perceptual re-block of near-dups
+            blocked[digest] = entry
             changed = True
     if len(blocked) > 10000:  # keep the state file bounded
         for old in list(blocked)[: len(blocked) - 10000]:

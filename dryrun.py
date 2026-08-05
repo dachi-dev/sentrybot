@@ -16,7 +16,8 @@ os.environ["SENTRY_ALLOWLIST"] = "1"  # guild 1 is premium; guild 2 stays free
 # leak between runs and make the scenarios non-deterministic.
 from pathlib import Path as _Path
 
-_Path("/tmp/dryrun_state.json").unlink(missing_ok=True)
+for _ext in (".json", ".db", ".db-wal", ".db-shm"):
+    _Path("/tmp/dryrun_state" + _ext).unlink(missing_ok=True)
 
 import discord
 from PIL import Image
@@ -432,6 +433,58 @@ async def main():
     sentry.HAS_PIL = _hp
     print("\n=== media-type sniff (declared png, actual gif) ===")
     print(f"  media_type (want image/gif): {frames[0][1] if frames else 'NONE'}")
+
+    # perceptual re-block: a near-duplicate of a blocked image is re-blocked with NO
+    # Claude call. Needs detailed images (solid colours hash degenerate), so draw shapes.
+    from PIL import ImageDraw
+
+    def detailed_png(seed):
+        img = Image.new("RGB", (400, 300), (200, 40, 40))
+        d = ImageDraw.Draw(img)
+        d.rectangle([40 + seed, 50, 200, 200], fill=(20, 20, 180))
+        d.ellipse([220, 80, 360, 220], fill=(240, 240, 20))
+        d.line([0, 0, 400, 300], fill=(0, 0, 0), width=6)
+        b = io.BytesIO(); img.save(b, format="PNG"); return b.getvalue()
+
+    def recompressed(raw):  # a near-duplicate: resize + JPEG re-encode
+        im = Image.open(io.BytesIO(raw)).resize((380, 285))
+        b = io.BytesIO(); im.save(b, format="JPEG", quality=70); return b.getvalue()
+
+    class RawAttachment:
+        def __init__(self, name, raw):
+            self.filename, self.content_type, self._raw = name, "image/png", raw
+        async def read(self):
+            return self._raw
+
+    orig = detailed_png(0)
+    near = recompressed(orig)          # visually identical, different bytes/format
+    unrelated = detailed_png(120)      # different composition
+
+    EVENTS.clear(); CALLS.clear(); sentry.verdict_cache.clear()
+    NEXT_VERDICT.clear(); NEXT_VERDICT.update(payload=gore); NEXT_VERDICT["raise"] = False
+    g = FakeGuild()
+    cfg = sentry.state.guild(g.id)
+    cfg.update(review_channel=77, restricted_role=999, approved_hashes=[],
+               blocked_hashes={}, disabled_categories=[], dry_run=False)
+
+    a0 = RawAttachment("orig.png", orig)
+    await sentry.process(FakeMessage(g, FakeChannel(10, "general"), [a0], ""), [a0], cfg)
+    first_calls = len(CALLS)
+    has_phash = any("phash" in e for e in cfg["blocked_hashes"].values())
+
+    CALLS.clear()
+    a1 = RawAttachment("near.png", near)
+    m1 = FakeMessage(g, FakeChannel(10, "general"), [a1], "")
+    await sentry.process(m1, [a1], cfg)
+    print("\n=== perceptual re-block of a near-duplicate ===")
+    print(f"  original blocked stored a phash (want Yes): {has_phash}")
+    print(f"  near-dup Claude calls (want 0)            : {len(CALLS)}")
+    print(f"  near-dup deleted (want Yes)               : {m1.deleted}")
+
+    CALLS.clear()
+    a2 = RawAttachment("unrel.png", unrelated)
+    await sentry.process(FakeMessage(g, FakeChannel(10, "general"), [a2], ""), [a2], cfg)
+    print(f"  unrelated image DOES call Claude (want 1) : {len(CALLS)}")
 
 
 asyncio.run(main())

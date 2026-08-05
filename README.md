@@ -187,11 +187,18 @@ Three buttons:
   if you see false positives; lower it to catch more borderline cases. This is separate
   from **sensitivity**, which changes *what* Claude flags; the threshold filters *how
   confident* a flag must be.
-- **Cost:** one Haiku call per image at ~800 input tokens, ~50 output. Identical
-  re-uploads cost nothing: an in-memory cache covers the current session, and moderator
-  decisions (both approvals and disapprovals) **persist to the state DB**, so a
-  reposted image that was already approved or already rejected never calls Claude again,
-  even across restarts. Rates: <https://claude.com/pricing>
+- **Cost:** one Haiku call per image at ~850 input tokens, ~50 output. Reposts cost
+  nothing: an in-memory cache covers the current session, and moderator decisions (both
+  approvals and disapprovals) **persist to the state DB**, so an image that was already
+  approved or rejected never calls Claude again, even across restarts. Rates:
+  <https://claude.com/pricing>
+- **Perceptual re-block.** A newly posted image within `SENTRY_PHASH_DISTANCE` (default 5
+  of 64, a 64-bit dHash) of a previously **blocked** image is re-blocked straight from
+  cache — **no Claude call** — so a re-compressed, resized, or lightly-edited repost of
+  banned content is caught by more than its exact bytes. It only ever re-uses *block*
+  verdicts, never *allow* (reusing an allow on a mere look-alike is how modified bad
+  content would slip through), and a false match just blocks something a mod can approve.
+  Lower the distance for stricter matching; set it below 0 to disable.
 - **Lower `SENTRY_MAX_EDGE` to 512** to roughly halve tokens and shave latency; obvious
   cases hold up well, borderline cases degrade.
 - **Videos are not scanned.** Claude vision takes images only — this includes the mp4
@@ -280,6 +287,8 @@ hundred active servers**:
   guild, and unchanged restarts make zero command calls. Cost is independent of guild
   count. Bump `COMMANDS_VERSION` (or just edit a command — the structural fingerprint
   catches it) to force the next start to re-sync.
+- **Perceptual re-block** cuts real Claude calls — near-duplicate reposts of banned content
+  short-circuit from cache, not just exact-byte reposts (see How detection works).
 
 > **Note on prompt caching:** it doesn't help here. The classifier's system prompt is only
 > ~850 tokens, and Haiku 4.5's minimum cacheable prefix is **4096 tokens**, so a
@@ -289,8 +298,6 @@ hundred active servers**:
 
 ### Future work (only needed beyond one busy box)
 
-- **Perceptual-hash pre-filter** — near-duplicate images short-circuit without a Claude
-  call, not just exact-byte reposts. Bigger cost lever than anything prompt-side here.
 - **Horizontal split** — move classification onto a queue (Redis/RabbitMQ) with a stateless
   worker pool, back the verdict/hash caches with **Redis** (they're per-process today), and
   point the dashboard at the DB instead of parsing the audit file. This is what lets you
