@@ -2190,18 +2190,24 @@ _ask_last: dict[int, float] = {}
 @app_commands.describe(
     question="What do you want to ask?",
     length="How long the answer should be (default: short)",
+    visibility="Post the answer for everyone (default), or show it only to you",
 )
 @app_commands.choices(
     length=[
         app_commands.Choice(name="short — 1-2 sentences", value="short"),
         app_commands.Choice(name="medium — a short paragraph", value="medium"),
         app_commands.Choice(name="long — detailed", value="long"),
-    ]
+    ],
+    visibility=[
+        app_commands.Choice(name="post — everyone can see it (default)", value="public"),
+        app_commands.Choice(name="private — only you can see it", value="private"),
+    ],
 )
 async def ask_cmd(
     interaction: discord.Interaction,
     question: str,
     length: app_commands.Choice[str] | None = None,
+    visibility: app_commands.Choice[str] | None = None,
 ):
     q = (question or "").strip()[:1000]
     if not q:
@@ -2215,8 +2221,9 @@ async def ask_cmd(
         return
     _ask_last[interaction.user.id] = time.monotonic()
 
+    private = bool(visibility) and visibility.value == "private"  # default: public
     max_tokens, guidance = ASK_LENGTHS[length.value if length else "short"]
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=private, thinking=True)
     try:
         async with check_semaphore:  # shares the rate-limit budget with scanning
             resp = await claude.messages.create(
@@ -2229,18 +2236,19 @@ async def ask_cmd(
             b.text for b in resp.content if getattr(b, "type", "") == "text"
         ).strip()
     except Exception:
-        log.exception("/sentry ask failed")
+        log.exception("/ask failed")
         await interaction.followup.send(
             "Sorry — I couldn't answer that right now.", ephemeral=True
         )
         return
 
     answer = answer or "I don't have an answer for that."
-    out = f"**You asked:** {q}\n\n{answer}"
+    header = f"**You asked:** {q}" if private else f"{interaction.user.mention} asked: **{q}**"
+    out = f"{header}\n\n{answer}"
     if len(out) > 1990:  # Discord's 2000-char message limit
         out = out[:1987] + "…"
     await interaction.followup.send(
-        out, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        out, ephemeral=private, allowed_mentions=discord.AllowedMentions.none()
     )
 
 
