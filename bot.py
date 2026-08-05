@@ -2222,23 +2222,43 @@ def _is_chat_trigger(message: discord.Message) -> bool:
     return False
 
 
-def _clean_content(m: discord.Message) -> str:
-    """Message text with mentions resolved to names and the bot's own mention stripped;
-    notes an image if the message carried one."""
+MAX_CHAT_IMAGES = 4  # most images (newest first) to actually show the model per reply
+
+
+async def _image_block(att: discord.Attachment) -> dict | None:
+    """Download an image attachment and return a base64 image block (downscaled by the
+    same pipeline moderation uses), or None if it isn't a usable image."""
+    if not (att.content_type or "").startswith("image/"):
+        return None
+    try:
+        raw = await att.read()
+    except discord.HTTPException:
+        return None
+    frames = await asyncio.to_thread(_extract_frames, raw, att.content_type or "image/png")
+    if not frames:
+        return None
+    data, media = frames[0]  # first (downscaled) frame is enough to understand a pic
+    return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
+
+
+def _clean_content(m: discord.Message, note_image: bool = True) -> str:
+    """Message text with mentions resolved to names and the bot's own mention stripped.
+    Notes '[sent an image]' only when the actual image isn't being attached to the turn."""
     text = (m.clean_content or "").strip()
     names = {bot.user.display_name, bot.user.name} if bot.user else set()
     if m.guild and m.guild.me:
         names.add(m.guild.me.display_name)
     for name in filter(None, names):
         text = text.replace(f"@{name}", "").strip()
-    if m.attachments:
+    if note_image and m.attachments:
         text = (text + " [sent an image]").strip()
     return text
 
 
 async def _build_chat_history(message: discord.Message) -> list[dict]:
-    """Walk up the reply chain and return chronological user/assistant turns, with each
-    non-bot message prefixed by the author's name so the model knows who said what."""
+    """Walk up the reply chain and return chronological user/assistant turns, each non-bot
+    message prefixed with the author's name. Images from the newest messages are attached
+    so the bot can actually see pics it was sent/replied to (up to MAX_CHAT_IMAGES)."""
     chain: list[discord.Message] = []
     msg: discord.Message | None = message
     while msg is not None and len(chain) < CHAT_CHAIN_LIMIT:
@@ -2256,13 +2276,37 @@ async def _build_chat_history(message: discord.Message) -> list[dict]:
         msg = nxt
     chain.reverse()  # oldest -> newest
 
+    self_id = bot.user.id if bot.user else None
+    # Attach real images from the newest messages first, up to the budget.
+    img_blocks: dict[int, list[dict]] = {}
+    budget = MAX_CHAT_IMAGES
+    for m in reversed(chain):
+        if budget <= 0:
+            break
+        if m.author.id == self_id or not m.attachments:
+            continue
+        blocks = []
+        for att in m.attachments:
+            if budget <= 0:
+                break
+            b = await _image_block(att)
+            if b is not None:
+                blocks.append(b)
+                budget -= 1
+        if blocks:
+            img_blocks[m.id] = blocks
+
     history: list[dict] = []
     for m in chain:
-        text = _clean_content(m)
-        if not text:
+        imgs = img_blocks.get(m.id, [])
+        text = _clean_content(m, note_image=not imgs)  # don't note a pic we're showing
+        if not text and not imgs:
             continue
-        if bot.user is not None and m.author.id == bot.user.id:
-            history.append({"role": "assistant", "content": text})
+        if m.author.id == self_id:
+            history.append({"role": "assistant", "content": text or "..."})
+        elif imgs:
+            label = f"{m.author.display_name}: {text}".strip()
+            history.append({"role": "user", "content": imgs + [{"type": "text", "text": label}]})
         else:
             history.append({"role": "user", "content": f"{m.author.display_name}: {text}"})
     while history and history[0]["role"] == "assistant":  # must start with a user turn
