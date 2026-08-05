@@ -2170,9 +2170,11 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
 # Top-level (not under /sentry) so it isn't gated by the group's Manage-Server
 # default permission — anyone in the server can use it.
 ASK_SYSTEM_BASE = (
-    "You are Dachi Warden, a helpful assistant in a Discord server answering a member's "
-    "question. Be helpful, direct, and accurate. Write plain text suitable for a Discord "
-    "message — no large headings. If you don't know or can't help, say so briefly."
+    "You are a helpful, knowledgeable general-purpose assistant answering a question from "
+    "a member of a Discord server. Answer any question directly and accurately, on ANY "
+    "topic — you are NOT limited to Discord, moderation, or this bot; treat it like a "
+    "normal question to a capable assistant. Write plain text suitable for a Discord "
+    "message (no large headings). If you genuinely don't know, say so briefly."
 )
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
     "short": (170, "Answer in 1-2 short sentences."),
