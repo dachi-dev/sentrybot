@@ -1335,14 +1335,18 @@ def _guild_scans(message: discord.Message, cfg: dict) -> bool:
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.guild is None:
+    if message.guild is None or message.author.bot:
         return
+    # Chatbot: reply when the bot is @mentioned or replied to (independent of moderation
+    # settings). Walks the reply chain for context — see _chat_reply.
+    if ASK_CHAT and _is_chat_trigger(message):
+        asyncio.create_task(_chat_reply(message))
     cfg = state.guild(message.guild.id)
-    if not _guild_scans(message, cfg):
-        return
     # Attachments and stickers are here now; link/GIF embeds usually arrive a moment
     # later via a message edit (handled in on_message_edit).
-    if message.attachments or message.stickers or message.embeds:
+    if _guild_scans(message, cfg) and (
+        message.attachments or message.stickers or message.embeds
+    ):
         asyncio.create_task(_scan_created(message, cfg))
 
 
@@ -2200,6 +2204,114 @@ ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
 }
 ASK_COOLDOWN = 8.0  # seconds between asks per user
 _ask_last: dict[int, float] = {}
+
+ASK_CHAT = os.getenv("SENTRY_ASK_CHAT", "1") != "0"  # reply to @mentions / replies
+CHAT_CHAIN_LIMIT = 8  # how many messages up a reply chain to include as context
+
+
+def _is_chat_trigger(message: discord.Message) -> bool:
+    """True when the bot is directly @mentioned, or a member replies to a bot message."""
+    if bot.user is None:
+        return False
+    if bot.user in message.mentions:  # direct user mention (not @everyone/role pings)
+        return True
+    ref = message.reference
+    if ref is not None and isinstance(ref.resolved, discord.Message):
+        return ref.resolved.author.id == bot.user.id
+    return False
+
+
+def _clean_content(m: discord.Message) -> str:
+    """Message text with mentions resolved to names and the bot's own mention stripped;
+    notes an image if the message carried one."""
+    text = (m.clean_content or "").strip()
+    names = {bot.user.display_name, bot.user.name} if bot.user else set()
+    if m.guild and m.guild.me:
+        names.add(m.guild.me.display_name)
+    for name in filter(None, names):
+        text = text.replace(f"@{name}", "").strip()
+    if m.attachments:
+        text = (text + " [sent an image]").strip()
+    return text
+
+
+async def _build_chat_history(message: discord.Message) -> list[dict]:
+    """Walk up the reply chain and return chronological user/assistant turns, with each
+    non-bot message prefixed by the author's name so the model knows who said what."""
+    chain: list[discord.Message] = []
+    msg: discord.Message | None = message
+    while msg is not None and len(chain) < CHAT_CHAIN_LIMIT:
+        chain.append(msg)
+        ref = msg.reference
+        nxt = None
+        if ref is not None:
+            if isinstance(ref.resolved, discord.Message):
+                nxt = ref.resolved
+            elif ref.message_id:
+                try:
+                    nxt = await msg.channel.fetch_message(ref.message_id)
+                except discord.HTTPException:
+                    nxt = None
+        msg = nxt
+    chain.reverse()  # oldest -> newest
+
+    history: list[dict] = []
+    for m in chain:
+        text = _clean_content(m)
+        if not text:
+            continue
+        if bot.user is not None and m.author.id == bot.user.id:
+            history.append({"role": "assistant", "content": text})
+        else:
+            history.append({"role": "user", "content": f"{m.author.display_name}: {text}"})
+    while history and history[0]["role"] == "assistant":  # must start with a user turn
+        history.pop(0)
+    return history
+
+
+async def _chat_reply(message: discord.Message) -> None:
+    now = time.monotonic()
+    if now - _ask_last.get(message.author.id, 0.0) < ASK_COOLDOWN:
+        return  # rate-limit silently
+    _ask_last[message.author.id] = now
+    try:
+        history = await _build_chat_history(message)
+    except Exception:
+        log.exception("building chat history failed")
+        return
+    if not history:
+        return
+
+    max_tokens, guidance = ASK_LENGTHS["short"]  # chat stays snappy
+    system = ASK_SYSTEM_BASE + (ASK_SEARCH_HINT if ASK_WEB_SEARCH else "") + " " + guidance
+    kwargs: dict = {"model": ASK_MODEL, "max_tokens": max_tokens, "system": system}
+    if ASK_WEB_SEARCH:
+        kwargs["tools"] = ASK_TOOLS
+    try:
+        async with message.channel.typing():
+            msgs = history
+            resp = None
+            for _ in range(3):  # resume across any web-search pause
+                async with check_semaphore:
+                    resp = await claude.messages.create(messages=msgs, **kwargs)
+                if resp.stop_reason != "pause_turn":
+                    break
+                msgs = msgs + [{"role": "assistant", "content": resp.content}]
+            answer = _extract_answer(resp)
+    except Exception:
+        log.exception("chat reply failed")
+        return
+    if not answer:
+        return
+    if len(answer) > 1990:
+        answer = answer[:1987] + "…"
+    try:
+        await message.reply(
+            answer, mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        log.warning("could not send chat reply in #%s", message.channel)
 
 
 def _extract_answer(resp) -> str:
