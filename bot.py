@@ -270,6 +270,11 @@ class State:
     def allowlist(self) -> list[str]:
         return list(self.data.get("__allowlist__", [])) + sorted(ALLOWLIST_ENV)
 
+    # --- bot-global metadata (command sync bookkeeping, etc.) ---
+
+    def meta(self) -> dict[str, Any]:
+        return self.data.setdefault("__meta__", {})
+
     def save(self) -> None:
         """Mark the store dirty and schedule a debounced flush. Callers keep using
         this exactly as before — it just no longer blocks on a full rewrite."""
@@ -627,7 +632,7 @@ class Sentry(discord.Client):
             except Exception:
                 log.exception("could not resolve application owner")
         await start_admin_dashboard()
-        # Commands are synced per-guild in on_ready (instant; avoids global lag).
+        # Commands are synced globally in on_ready, only when they've changed.
 
     async def close(self):
         state.flush()  # persist any debounced writes before we go down
@@ -1159,18 +1164,68 @@ def _missing_perms(guild: discord.Guild) -> list[str]:
 _synced_once = False
 
 
-async def _sync_commands_to_guilds():
-    """Guild-only registration: guild commands propagate to clients instantly (global
-    changes lag up to an hour). Clear the global scope so there are no duplicates."""
-    try:
+# Bump this if a command change isn't reflected by the structural fingerprint below
+# (e.g. an autocomplete or permissions tweak) and you need to force a re-sync.
+COMMANDS_VERSION = "1"
+
+
+def _command_signature() -> str:
+    """Stable hash of the global command tree (names, descriptions, params, choices).
+    Used to skip the sync entirely when nothing changed."""
+
+    def walk(cmds) -> str:
+        parts = []
+        for c in sorted(cmds, key=lambda x: x.name):
+            if isinstance(c, app_commands.Group):
+                parts.append(f"G:{c.name}:{c.description}:[{walk(c.commands)}]")
+            else:
+                params = ";".join(
+                    f"{p.name},{p.type},{p.required},"
+                    + "/".join(str(ch.value) for ch in (getattr(p, 'choices', None) or []))
+                    for p in c.parameters
+                )
+                parts.append(f"C:{c.name}:{c.description}:({params})")
+        return "|".join(parts)
+
+    raw = f"{COMMANDS_VERSION}#{walk(bot.tree.get_commands())}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def _sync_commands():
+    """Register commands GLOBALLY with one API call — global commands apply to every
+    guild the bot is in automatically, so this cost is independent of guild count
+    (the old per-guild loop was O(guilds) per startup). To avoid the ghost/duplicate
+    churn that broke rapid syncing before, we only call sync() when the command tree
+    actually changed since the last run."""
+    meta = state.meta()
+
+    # 1) Register globally first, only when the command set actually changed.
+    sig = _command_signature()
+    if meta.get("cmd_sig") != sig:
+        try:
+            await bot.tree.sync()  # single global sync
+            meta["cmd_sig"] = sig
+            state.save()
+            log.info("commands synced globally (may take up to ~1h to propagate)")
+        except discord.HTTPException:
+            log.exception("global command sync failed")
+            return
+    else:
+        log.info("commands unchanged; skipping sync")
+
+    # 2) One-time migration off the old guild-scoped registration: clear the per-guild
+    #    copies so they don't duplicate the global ones. Done AFTER the global sync so
+    #    users never see a window with no commands. Runs once, ever.
+    if not meta.get("global_migrated"):
         for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)  # copy while globals still in the tree
-            await bot.tree.sync(guild=guild)
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()  # push empty global set -> removes global commands
-        log.info("commands guild-synced to %d guild(s)", len(bot.guilds))
-    except Exception:
-        log.exception("command sync failed")
+            try:
+                bot.tree.clear_commands(guild=guild)
+                await bot.tree.sync(guild=guild)
+            except discord.HTTPException:
+                log.exception("failed clearing old guild commands for %s", guild.id)
+        meta["global_migrated"] = True
+        state.save()
+        log.info("cleared old guild-scoped commands on %d guild(s)", len(bot.guilds))
 
 
 @bot.event
@@ -1183,21 +1238,17 @@ async def on_ready():
             log.warning("guild '%s' missing permissions: %s", guild.name, ", ".join(missing))
     if not _synced_once:
         _synced_once = True
-        await _sync_commands_to_guilds()
+        await _sync_commands()
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
+    # Global commands apply to new guilds automatically — no per-guild sync needed.
     missing = _missing_perms(guild)
     if missing:
         log.warning("joined '%s' missing permissions: %s", guild.name, ", ".join(missing))
     else:
         log.info("joined '%s' with all required permissions", guild.name)
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-    except Exception:
-        log.exception("guild command sync on join failed for %s", guild.id)
 
 
 def _is_reviewer(guild: discord.Guild, member, cfg: dict) -> bool:
