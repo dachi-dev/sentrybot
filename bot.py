@@ -62,6 +62,7 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 MODEL = os.getenv("SENTRY_MODEL", "claude-haiku-4-5-20251001")
+ASK_MODEL = os.getenv("SENTRY_ASK_MODEL", MODEL)  # model for the /sentry ask helper
 STATE_PATH = Path(os.getenv("SENTRY_STATE", "sentry_state.json"))
 RESTRICTED_ROLE_NAME = "Media Restricted"
 
@@ -2162,6 +2163,79 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
         if ok
         else "Failed — check my role position and Manage Roles permission.",
         ephemeral=True,
+    )
+
+
+# --- /sentry ask: a lightweight question-answering helper -----------------
+ASK_SYSTEM_BASE = (
+    "You are Dachi Warden, a Discord moderation bot answering a question from a server "
+    "moderator. Be helpful, direct, and accurate. Write plain text suitable for a Discord "
+    "message — no large headings. If you don't know or can't help, say so briefly."
+)
+ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
+    "short": (170, "Answer in 1-2 short sentences."),
+    "medium": (450, "Answer in a short paragraph (a few sentences)."),
+    "long": (900, "Answer thoroughly and completely, but keep it under ~350 words."),
+}
+ASK_COOLDOWN = 8.0  # seconds between asks per user
+_ask_last: dict[int, float] = {}
+
+
+@mod.command(name="ask", description="Ask a question and get an answer")
+@app_commands.describe(
+    question="What do you want to ask?",
+    length="How long the answer should be (default: short)",
+)
+@app_commands.choices(
+    length=[
+        app_commands.Choice(name="short — 1-2 sentences", value="short"),
+        app_commands.Choice(name="medium — a short paragraph", value="medium"),
+        app_commands.Choice(name="long — detailed", value="long"),
+    ]
+)
+async def ask_cmd(
+    interaction: discord.Interaction,
+    question: str,
+    length: app_commands.Choice[str] | None = None,
+):
+    q = (question or "").strip()[:1000]
+    if not q:
+        await interaction.response.send_message("Ask me a question.", ephemeral=True)
+        return
+    wait = ASK_COOLDOWN - (time.monotonic() - _ask_last.get(interaction.user.id, 0.0))
+    if wait > 0:
+        await interaction.response.send_message(
+            f"Please wait {wait:.0f}s before asking again.", ephemeral=True
+        )
+        return
+    _ask_last[interaction.user.id] = time.monotonic()
+
+    max_tokens, guidance = ASK_LENGTHS[length.value if length else "short"]
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        async with check_semaphore:  # shares the rate-limit budget with scanning
+            resp = await claude.messages.create(
+                model=ASK_MODEL,
+                max_tokens=max_tokens,
+                system=f"{ASK_SYSTEM_BASE} {guidance}",
+                messages=[{"role": "user", "content": q}],
+            )
+        answer = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        ).strip()
+    except Exception:
+        log.exception("/sentry ask failed")
+        await interaction.followup.send(
+            "Sorry — I couldn't answer that right now.", ephemeral=True
+        )
+        return
+
+    answer = answer or "I don't have an answer for that."
+    out = f"**You asked:** {q}\n\n{answer}"
+    if len(out) > 1990:  # Discord's 2000-char message limit
+        out = out[:1987] + "…"
+    await interaction.followup.send(
+        out, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
     )
 
 
