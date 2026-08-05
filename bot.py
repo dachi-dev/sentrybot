@@ -2169,20 +2169,45 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
 # --- /ask: a lightweight question-answering helper (open to everyone) ------
 # Top-level (not under /sentry) so it isn't gated by the group's Manage-Server
 # default permission — anyone in the server can use it.
+ASK_WEB_SEARCH = os.getenv("SENTRY_ASK_WEB_SEARCH", "1") != "0"  # let /ask look things up
+ASK_TOOLS = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
 ASK_SYSTEM_BASE = (
     "You are a helpful, knowledgeable general-purpose assistant answering a question from "
     "a member of a Discord server. Answer any question directly and accurately, on ANY "
     "topic — you are NOT limited to Discord, moderation, or this bot; treat it like a "
     "normal question to a capable assistant. Write plain text suitable for a Discord "
-    "message (no large headings). If you genuinely don't know, say so briefly."
+    "message (no large headings). If you genuinely cannot answer, say so briefly."
 )
+ASK_SEARCH_HINT = (
+    " Use the web search tool whenever the answer depends on current events, a specific "
+    "place, business, product, or person, recent or niche information, or anything you are "
+    "not certain about — do not rely on memory for those. Do not narrate that you are "
+    "searching; just give the final answer."
+)
+# Ceilings leave room for the search query + answer; the guidance controls actual length.
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
-    "short": (170, "Answer in 1-2 short sentences."),
-    "medium": (450, "Answer in a short paragraph (a few sentences)."),
-    "long": (900, "Answer thoroughly and completely, but keep it under ~350 words."),
+    "short": (500, "Answer in 1-2 short sentences."),
+    "medium": (800, "Answer in a short paragraph (a few sentences)."),
+    "long": (1400, "Answer thoroughly and completely, but keep it under ~350 words."),
 }
 ASK_COOLDOWN = 8.0  # seconds between asks per user
 _ask_last: dict[int, float] = {}
+
+
+def _extract_answer(resp) -> str:
+    """The final answer text — text after the last tool activity, so a 'let me search'
+    preamble is dropped. Falls back to all text if there was no tool use."""
+    blocks = list(resp.content)
+    last_tool = -1
+    for i, b in enumerate(blocks):
+        t = getattr(b, "type", "")
+        if t == "server_tool_use" or "tool_result" in t:
+            last_tool = i
+    tail = blocks[last_tool + 1:] if last_tool >= 0 else blocks
+    text = "".join(b.text for b in tail if getattr(b, "type", "") == "text").strip()
+    if not text:
+        text = "".join(b.text for b in blocks if getattr(b, "type", "") == "text").strip()
+    return text
 
 
 @bot.tree.command(name="ask", description="Ask a question and get an answer")
@@ -2223,18 +2248,22 @@ async def ask_cmd(
 
     private = bool(visibility) and visibility.value == "private"  # default: public
     max_tokens, guidance = ASK_LENGTHS[length.value if length else "short"]
+    system = ASK_SYSTEM_BASE + (ASK_SEARCH_HINT if ASK_WEB_SEARCH else "") + " " + guidance
+    kwargs: dict = {"model": ASK_MODEL, "max_tokens": max_tokens, "system": system}
+    if ASK_WEB_SEARCH:
+        kwargs["tools"] = ASK_TOOLS
+
     await interaction.response.defer(ephemeral=private, thinking=True)
     try:
-        async with check_semaphore:  # shares the rate-limit budget with scanning
-            resp = await claude.messages.create(
-                model=ASK_MODEL,
-                max_tokens=max_tokens,
-                system=f"{ASK_SYSTEM_BASE} {guidance}",
-                messages=[{"role": "user", "content": q}],
-            )
-        answer = "".join(
-            b.text for b in resp.content if getattr(b, "type", "") == "text"
-        ).strip()
+        messages = [{"role": "user", "content": q}]
+        resp = None
+        for _ in range(3):  # a web search may pause the turn; resume until it's done
+            async with check_semaphore:  # shares the rate-limit budget with scanning
+                resp = await claude.messages.create(messages=messages, **kwargs)
+            if resp.stop_reason != "pause_turn":
+                break
+            messages.append({"role": "assistant", "content": resp.content})
+        answer = _extract_answer(resp)
     except Exception:
         log.exception("/ask failed")
         await interaction.followup.send(
