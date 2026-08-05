@@ -263,8 +263,10 @@ it publicly (token-protected), but a tunnel is safer.
   can eyeball false positives directly. Off by default. The filename's sha256 matches the
   audit log, so you can cross-ref.
 - Review buttons are persistent — they keep working after a restart.
-- One process, asyncio semaphore capping concurrent API calls at 4. An image-spam raid
-  queues rather than fanning out, which lengthens the visibility window under load.
+- One process, asyncio semaphore capping concurrent Claude calls at `SENTRY_CONCURRENCY`
+  (default **8**). Under a raid, scans queue behind those slots rather than fanning out
+  unbounded. Raise it on a bigger box / higher Anthropic tier; 429s self-throttle by
+  honoring the server's `retry-after`, so over-provisioning fails safe rather than hard.
 
 ## Scaling
 
@@ -279,15 +281,16 @@ hundred active servers**:
   count. Bump `COMMANDS_VERSION` (or just edit a command — the structural fingerprint
   catches it) to force the next start to re-sync.
 
+> **Note on prompt caching:** it doesn't help here. The classifier's system prompt is only
+> ~850 tokens, and Haiku 4.5's minimum cacheable prefix is **4096 tokens**, so a
+> `cache_control` marker would silently do nothing (`cache_creation_input_tokens: 0`). The
+> image is different every scan and so is never cacheable either. Not worth it unless the
+> prompt grows several-fold or the model changes.
+
 ### Future work (only needed beyond one busy box)
 
-- **Prompt-cache the system prompt** — the ~700-token classifier prompt is re-sent on
-  every scan. Caching it would cut per-scan input cost to ~0.1× on repeats and reduce
-  latency. Highest-leverage remaining cost lever.
-- **Raise `SENTRY_CONCURRENCY`** (currently 4) as your Anthropic rate limits allow — the
-  global semaphore is what lengthens the visibility window under a raid.
 - **Perceptual-hash pre-filter** — near-duplicate images short-circuit without a Claude
-  call, not just exact-byte reposts.
+  call, not just exact-byte reposts. Bigger cost lever than anything prompt-side here.
 - **Horizontal split** — move classification onto a queue (Redis/RabbitMQ) with a stateless
   worker pool, back the verdict/hash caches with **Redis** (they're per-process today), and
   point the dashboard at the DB instead of parsing the audit file. This is what lets you

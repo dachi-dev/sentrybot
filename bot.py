@@ -103,7 +103,10 @@ ALLOWLIST_ENV = {
 }
 OWNER_ID = int(os.getenv("SENTRY_OWNER_ID", "0"))  # 0 => resolved from the app owner
 
-MAX_CONCURRENT_CHECKS = int(os.getenv("SENTRY_CONCURRENCY", "4"))
+# Max simultaneous Claude calls. Higher = shorter visibility window under a raid, but
+# bounded by your Anthropic rate-limit tier (429s self-throttle via retry-after below)
+# and the host's RAM/CPU. Raise it on a bigger box.
+MAX_CONCURRENT_CHECKS = int(os.getenv("SENTRY_CONCURRENCY", "8"))
 VERDICT_CACHE_SIZE = 512
 
 SUPPORTED_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -500,6 +503,7 @@ async def _classify_one(
     """One Claude vision call on one prepared frame, retrying transient failures with
     backoff. Never raises; fails open (verdict=allow, error=True) once it gives up."""
     for attempt in range(3):
+        delay = 2**attempt  # default backoff: 1s, 2s
         try:
             async with check_semaphore:
                 resp = await claude.messages.create(
@@ -546,14 +550,23 @@ async def _classify_one(
             retryable = True
         except anthropic.APIStatusError as e:
             retryable = e.status_code in _RETRYABLE_STATUS
-            if not retryable:
+            if retryable and e.status_code == 429:
+                # Rate-limited: wait the server-suggested time (capped so a single scan
+                # can't hang) instead of a blind backoff — matters at high concurrency.
+                try:
+                    retry_after = float(e.response.headers.get("retry-after", 0))
+                    if retry_after > 0:
+                        delay = min(retry_after, 10.0)
+                except (TypeError, ValueError, AttributeError):
+                    pass
+            elif not retryable:
                 log.warning("classification rejected (%s): %s", e.status_code, e)
         except Exception:
             log.exception("classification failed")
             retryable = False
         if not retryable or attempt == 2:
             break
-        await asyncio.sleep(2**attempt)  # 1s, 2s
+        await asyncio.sleep(delay)
 
     return {
         "verdict": "allow",  # fail open: a failed check never takes action
