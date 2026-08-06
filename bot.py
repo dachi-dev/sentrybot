@@ -2370,6 +2370,8 @@ def _extract_answer(resp) -> str:
     text = "".join(b.text for b in tail if getattr(b, "type", "") == "text").strip()
     if not text:
         text = "".join(b.text for b in blocks if getattr(b, "type", "") == "text").strip()
+    # Guarantee no em dashes regardless of what the model produced.
+    text = re.sub(r"\s*—\s*", ", ", text)
     return text
 
 
