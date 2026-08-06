@@ -2223,32 +2223,53 @@ def _is_chat_trigger(message: discord.Message) -> bool:
 MAX_CHAT_IMAGES = 4  # most images (newest first) to actually show the model per reply
 
 
-async def _image_block(att: discord.Attachment) -> dict | None:
-    """Download an image attachment and return a base64 image block (downscaled by the
-    same pipeline moderation uses), or None if it isn't a usable image."""
-    if not (att.content_type or "").startswith("image/"):
-        return None
-    try:
-        raw = await att.read()
-    except discord.HTTPException:
-        return None
-    frames = await asyncio.to_thread(_extract_frames, raw, att.content_type or "image/png")
+def _raw_to_image_block(raw: bytes, mime: str) -> dict | None:
+    """Downscale/sniff raw image bytes via the moderation pipeline into a base64 block."""
+    frames = _extract_frames(raw, mime)
     if not frames:
         return None
     data, media = frames[0]  # first (downscaled) frame is enough to understand a pic
     return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
 
 
-def _clean_content(m: discord.Message, note_image: bool = True) -> str:
+async def _message_image_blocks(message: discord.Message, budget: int) -> list[dict]:
+    """Base64 image blocks for every image the moderation scanner would see on a message —
+    attachments, (non-Lottie) stickers, and embedded images / Tenor+Giphy GIFs / links —
+    so chat understands the same content types moderation does. Capped by budget."""
+    if budget <= 0:
+        return []
+    sources: list[tuple[bytes, str]] = []
+    for _, mime, raw in await _sticker_attachment_payloads(message):  # attachments + stickers
+        sources.append((raw, mime))
+    for _, url in _embed_image_urls(message):  # embed images, GIF previews, image links
+        raw = await _fetch_image_bytes(url)
+        if raw:
+            sources.append((raw, "image/png"))
+    blocks: list[dict] = []
+    for raw, mime in sources:
+        if budget <= 0:
+            break
+        b = await asyncio.to_thread(_raw_to_image_block, raw, mime)
+        if b is not None:
+            blocks.append(b)
+            budget -= 1
+    return blocks
+
+
+def _has_media(m: discord.Message) -> bool:
+    return bool(m.attachments or m.stickers or _embed_image_urls(m))
+
+
+def _clean_content(m: discord.Message, note_image: bool = False) -> str:
     """Message text with mentions resolved to names and the bot's own mention stripped.
-    Notes '[sent an image]' only when the actual image isn't being attached to the turn."""
+    Appends '[sent an image]' when note_image is set (image present but not attached)."""
     text = (m.clean_content or "").strip()
     names = {bot.user.display_name, bot.user.name} if bot.user else set()
     if m.guild and m.guild.me:
         names.add(m.guild.me.display_name)
     for name in filter(None, names):
         text = text.replace(f"@{name}", "").strip()
-    if note_image and m.attachments:
+    if note_image:
         text = (text + " [sent an image]").strip()
     return text
 
@@ -2281,23 +2302,18 @@ async def _build_chat_history(message: discord.Message) -> list[dict]:
     for m in reversed(chain):
         if budget <= 0:
             break
-        if m.author.id == self_id or not m.attachments:
+        if m.author.id == self_id or not _has_media(m):
             continue
-        blocks = []
-        for att in m.attachments:
-            if budget <= 0:
-                break
-            b = await _image_block(att)
-            if b is not None:
-                blocks.append(b)
-                budget -= 1
+        blocks = await _message_image_blocks(m, budget)
         if blocks:
             img_blocks[m.id] = blocks
+            budget -= len(blocks)
 
     history: list[dict] = []
     for m in chain:
         imgs = img_blocks.get(m.id, [])
-        text = _clean_content(m, note_image=not imgs)  # don't note a pic we're showing
+        # note "[sent an image]" only when media was present but we didn't attach it
+        text = _clean_content(m, note_image=_has_media(m) and not imgs)
         if not text and not imgs:
             continue
         if m.author.id == self_id:
