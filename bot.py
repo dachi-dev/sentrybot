@@ -2173,8 +2173,11 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
 # --- /ask: a lightweight question-answering helper (open to everyone) ------
 # Top-level (not under /sentry) so it isn't gated by the group's Manage-Server
 # default permission — anyone in the server can use it.
-ASK_WEB_SEARCH = os.getenv("SENTRY_ASK_WEB_SEARCH", "1") != "0"  # let /ask look things up
-ASK_TOOLS = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+ASK_WEB_SEARCH = os.getenv("SENTRY_ASK_WEB_SEARCH", "1") != "0"  # look things up + read links
+ASK_TOOLS = [
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3},  # read pasted URLs
+]
 ASK_SYSTEM_BASE = (
     "You are Dachi Warden, an alpha male with ultimate rizz — the most confident, smooth, "
     "effortlessly charismatic guy in the Discord server. Unbothered and self-assured, a "
@@ -2192,8 +2195,10 @@ ASK_SYSTEM_BASE = (
 ASK_SEARCH_HINT = (
     " Use the web search tool whenever the answer depends on current events, a specific "
     "place, business, product, or person, recent or niche information, or anything you are "
-    "not certain about — do not rely on memory for those. Do not narrate that you are "
-    "searching; just give the final answer."
+    "not certain about, and do not rely on memory for those. When a member shares a link "
+    "(a GitHub repo, an article, docs, any URL), use the web fetch tool to actually read "
+    "that page before answering instead of guessing or just searching for it. Do not "
+    "narrate that you are searching or fetching; just give the final answer."
 )
 # Ceilings leave room for the search query + answer; the guidance controls actual length.
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
