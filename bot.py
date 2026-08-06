@@ -2176,8 +2176,7 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
 ASK_WEB_SEARCH = os.getenv("SENTRY_ASK_WEB_SEARCH", "1") != "0"  # look things up + read links
 ASK_TOOLS = [
     {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
-    # higher fetch budget so it can read multiple files (e.g. traverse a repo's source)
-    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 10},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 6},
 ]
 ASK_SYSTEM_BASE = (
     "You are Dachi Warden, an alpha male with ultimate rizz — the most confident, smooth, "
@@ -2196,18 +2195,16 @@ ASK_SYSTEM_BASE = (
 ASK_SEARCH_HINT = (
     " Use the web search tool whenever the answer depends on current events, a specific "
     "place, business, product, or person, recent or niche information, or anything you are "
-    "not certain about, and do not rely on memory for those. When a member shares a link, "
-    "use the web fetch tool to actually read that page before answering. To review a "
-    "GitHub repo's code: do NOT use api.github.com (it is blocked); instead fetch the repo "
-    "and folder pages on github.com (e.g. https://github.com/OWNER/REPO and "
-    "https://github.com/OWNER/REPO/tree/BRANCH/FOLDER) to find the file names, then fetch "
-    "each source file's raw content at https://raw.githubusercontent.com/OWNER/REPO/BRANCH/"
-    "PATH and read it. When asked to review, audit, or find bugs/vulns in code, put the "
-    "casual brevity aside and be THOROUGH: actually fetch and read the real source files "
-    "(this can take several fetches) before answering, then give a concrete assessment "
-    "citing file names. Those raw files are readable, so never say you cannot access them, "
-    "cannot dive into the files, or that the user should audit it themselves. Do not "
-    "narrate that you are searching or fetching; just give the final answer."
+    "not certain about, and do not rely on memory for those. When a member shares a link "
+    "(an article, a page, a repo), use the web fetch tool to read it before answering. "
+    "Note your fetch limits: you can read a page or a specific raw file URL "
+    "(https://raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH) when you have the exact "
+    "link, but you canNOT browse a whole GitHub repo's file tree — api.github.com and the "
+    "github.com tree/blob pages are not fetchable, and raw file URLs only work once their "
+    "exact path is known. So for a code review, read what you can (README, any raw file "
+    "links you already have) and, if you need the source, ask the member to paste the "
+    "specific files or their raw file links rather than making many failed fetch attempts. "
+    "Do not narrate that you are searching or fetching; just give the final answer."
 )
 # Ceilings leave room for the search query + answer; the guidance controls actual length.
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
