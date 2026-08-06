@@ -2176,7 +2176,7 @@ async def restrict_cmd(interaction: discord.Interaction, member: discord.Member)
 ASK_WEB_SEARCH = os.getenv("SENTRY_ASK_WEB_SEARCH", "1") != "0"  # look things up + read links
 ASK_TOOLS = [
     {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
-    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 6},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3},  # read pasted URLs
 ]
 ASK_SYSTEM_BASE = (
     "You are Dachi Warden, an alpha male with ultimate rizz — the most confident, smooth, "
@@ -2196,15 +2196,9 @@ ASK_SEARCH_HINT = (
     " Use the web search tool whenever the answer depends on current events, a specific "
     "place, business, product, or person, recent or niche information, or anything you are "
     "not certain about, and do not rely on memory for those. When a member shares a link "
-    "(an article, a page, a repo), use the web fetch tool to read it before answering. "
-    "Note your fetch limits: you can read a page or a specific raw file URL "
-    "(https://raw.githubusercontent.com/OWNER/REPO/BRANCH/PATH) when you have the exact "
-    "link, but you canNOT browse a whole GitHub repo's file tree — api.github.com and the "
-    "github.com tree/blob pages are not fetchable, and raw file URLs only work once their "
-    "exact path is known. So for a code review, read what you can (README, any raw file "
-    "links you already have) and, if you need the source, ask the member to paste the "
-    "specific files or their raw file links rather than making many failed fetch attempts. "
-    "Do not narrate that you are searching or fetching; just give the final answer."
+    "(a GitHub repo, an article, docs, any URL), use the web fetch tool to actually read "
+    "that page before answering instead of guessing or just searching for it. Do not "
+    "narrate that you are searching or fetching; just give the final answer."
 )
 # Ceilings leave room for the search query + answer; the guidance controls actual length.
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
