@@ -2202,9 +2202,12 @@ ASK_SEARCH_HINT = (
     "and folder pages on github.com (e.g. https://github.com/OWNER/REPO and "
     "https://github.com/OWNER/REPO/tree/BRANCH/FOLDER) to find the file names, then fetch "
     "each source file's raw content at https://raw.githubusercontent.com/OWNER/REPO/BRANCH/"
-    "PATH and read it. Those raw files are readable, so analyze what you fetch and cite "
-    "file names, and never claim you cannot access files you have fetched. Do not narrate "
-    "that you are searching or fetching; just give the final answer."
+    "PATH and read it. When asked to review, audit, or find bugs/vulns in code, put the "
+    "casual brevity aside and be THOROUGH: actually fetch and read the real source files "
+    "(this can take several fetches) before answering, then give a concrete assessment "
+    "citing file names. Those raw files are readable, so never say you cannot access them, "
+    "cannot dive into the files, or that the user should audit it themselves. Do not "
+    "narrate that you are searching or fetching; just give the final answer."
 )
 # Ceilings leave room for the search query + answer; the guidance controls actual length.
 ASK_LENGTHS = {  # value -> (max_tokens, length guidance for the system prompt)
