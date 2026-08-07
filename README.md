@@ -6,7 +6,7 @@ threats, doxxing, self-harm, hard drugs, and scam/spam. The poster loses image
 permissions and a case lands in your review channel with approve/uphold buttons.
 
 Clean images are never touched — they keep their real author, replies, reactions and
-edit history. Single file, no database, ~800 input tokens per image.
+edit history. Single file, no database, ~550 input tokens per image at the default 640px.
 
 ## Setup
 
@@ -59,8 +59,8 @@ All `/sentry` commands require Manage Server. Review buttons require Manage Mess
    - **Direct image links, and Tenor/Giphy GIFs** — Discord attaches these as *embeds*
      a moment after posting, so they're caught on `on_message_edit`. Article/website/
      YouTube link previews are intentionally skipped.
-2. Each image is downscaled to 768px and sent to Claude Haiku. **Animated GIF/WebP are
-   sampled across up to `SENTRY_GIF_FRAMES` (default 4) frames** — a clip that's clean on
+2. Each image is downscaled to 640px and sent to Claude Haiku. **Animated GIF/WebP are
+   sampled across up to `SENTRY_GIF_FRAMES` (default 3) frames** — a clip that's clean on
    frame one but not later doesn't slip through; the first blocked frame condemns it.
 3. Clean → nothing happens at all. No edit, no repost, no trace.
 4. Flagged → message deleted, author restricted, case opened, author DM'd.
