@@ -36,7 +36,10 @@ class FakeMessages:
         if NEXT_VERDICT.get("raise"):
             raise RuntimeError("simulated API outage")
         body = json.dumps(NEXT_VERDICT["payload"])[1:]  # strip "{" for the prefill
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=body)])
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=body)],
+            usage=SimpleNamespace(input_tokens=800, output_tokens=40),
+        )
 
 
 sentry.claude = SimpleNamespace(messages=FakeMessages())
@@ -422,6 +425,21 @@ async def main():
     await sentry.process(mp, [ap], cfgp)
     print("\n=== premium scans are counted (guild 1) ===")
     print(f"  premium scan_count (want 1): {cfgp.get('scan_count')}")
+
+    # cost metering: one fresh scan bills its real tokens (800 in + 40 out from the stub)
+    # against the guild; at the default $1/$5 per-MTok rate that's $0.001. A repeat of the
+    # same image is a cache hit -> no API call -> no new charge.
+    print("\n=== per-server cost is metered from real tokens (guild 1) ===")
+    au = FakeAttachment("meter.png", (12, 34, 56))  # a fresh, uncached colour
+    mu = FakeMessage(prem, FakeChannel(10, "general"), [au], "meter me")
+    in0, out0, usd0 = (cfgp.get(k, 0) for k in ("spend_in", "spend_out", "spend_usd"))
+    await sentry.process(mu, [au], cfgp)
+    print(f"  input tokens billed (want 800) : {cfgp.get('spend_in') - in0}")
+    print(f"  output tokens billed (want 40) : {cfgp.get('spend_out') - out0}")
+    print(f"  usd billed (want 0.0010)       : {cfgp.get('spend_usd') - usd0:.4f}")
+    usd1 = cfgp.get("spend_usd")
+    await sentry.process(mu, [au], cfgp)  # identical image -> cache hit, no new charge
+    print(f"  cache hit adds no cost (want same): {cfgp.get('spend_usd') == usd1}")
 
     # media-type sniff: a GIF forced through the raw fallback is labeled image/gif
     _hp = sentry.HAS_PIL

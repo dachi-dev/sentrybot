@@ -236,13 +236,21 @@ manages **every server from one place** — you don't need to be in the server o
 slash commands:
 
 - **Overview** (`/`) — all servers with tier, member count, a **health** flag (⚠️ if a
-  server is misconfigured, e.g. enabled with no review channel), premium grant/revoke, and
-  a totals line (server count, premium count, scans today).
+  server is misconfigured, e.g. enabled with no review channel), each server's **Claude
+  cost**, premium grant/revoke, and a totals line (server count, premium count, scans
+  today, total Claude cost).
 - **Per-server settings** (`/guild?id=…`) — every knob a server admin can change:
   scanning on/off, enforce vs. watch-only, sensitivity, confidence threshold, each
   category on/off, and the review-channel / restricted-role / alert-role / excluded-channel
-  bindings (by ID). Also shows that server's free-tier quota with a **reset** button and
-  its recent moderation activity.
+  bindings (by ID). Also shows that server's free-tier quota with a **reset** button, its
+  **lifetime Claude cost** (with the token breakdown), and its recent moderation activity.
+
+  Cost is **metered from the real token counts** Claude returns on every call — image
+  scans, `/ask`, and chat — and priced at `SENTRY_PRICE_IN` / `SENTRY_PRICE_OUT` per
+  million tokens (defaults are Haiku 4.5's published $1 in / $5 out). Cache hits and
+  near-duplicate re-blocks make no API call and cost nothing. Anthropic bills per account,
+  not per Discord server, so this self-metering is the only way to attribute spend per
+  guild — the billing API can't split it out.
 - **Activity** (`/activity`) — the recent audit trail across all servers (removals, check
   failures, dry-run flags, moderator actions), newest first.
 

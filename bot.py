@@ -63,6 +63,31 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 MODEL = os.getenv("SENTRY_MODEL", "claude-haiku-4-5-20251001")
 ASK_MODEL = os.getenv("SENTRY_ASK_MODEL", MODEL)  # model for the /sentry ask helper
+
+# Per-server cost is metered from the REAL token counts Claude returns on every call
+# (resp.usage), then priced at these per-million-token rates. Nothing dollar-related is
+# baked into the logic: the rate lives here and defaults to Haiku 4.5's published price
+# ($1 in / $5 out per MTok). Override via env if you switch models or the rate changes.
+# (Anthropic bills per account, not per Discord server, so real per-guild attribution
+# can only come from this self-metering — the billing API can't split spend by guild.)
+PRICE_IN_PER_MTOK = float(os.getenv("SENTRY_PRICE_IN", "1.0"))
+PRICE_OUT_PER_MTOK = float(os.getenv("SENTRY_PRICE_OUT", "5.0"))
+
+
+def _record_cost(cfg: dict, usage: "tuple[int, int] | None") -> None:
+    """Add one real API call's (input, output) token usage to a guild's lifetime spend.
+    ``usage`` comes straight from ``resp.usage``; None means no billable call happened
+    (a cache hit or perceptual re-block), so nothing is charged."""
+    if not usage:
+        return
+    tin, tout = usage
+    if not tin and not tout:
+        return
+    cfg["spend_in"] = cfg.get("spend_in", 0) + int(tin)
+    cfg["spend_out"] = cfg.get("spend_out", 0) + int(tout)
+    cfg["spend_usd"] = cfg.get("spend_usd", 0.0) + (
+        tin * PRICE_IN_PER_MTOK + tout * PRICE_OUT_PER_MTOK
+    ) / 1_000_000
 STATE_PATH = Path(os.getenv("SENTRY_STATE", "sentry_state.json"))
 RESTRICTED_ROLE_NAME = "Media Restricted"
 
@@ -187,6 +212,9 @@ _GUILD_DEFAULTS: dict[str, Any] = {
     "alert_role": None,  # role pinged on every removal
     "allowances": list,  # community-specific exceptions injected into the prompt
     "exempt_reviewers": True,  # skip anyone who can see the review channel (staff)
+    "spend_in": 0,  # lifetime input tokens billed to this guild (real resp.usage)
+    "spend_out": 0,  # lifetime output tokens billed to this guild
+    "spend_usd": 0.0,  # lifetime USD spend = tokens x the configured rate
 }
 
 
@@ -576,6 +604,12 @@ async def _classify_one(
                 b.text for b in resp.content if getattr(b, "type", "") == "text"
             )
             verdict = json.loads(text[: text.rindex("}") + 1])
+            u = getattr(resp, "usage", None)
+            verdict["usage"] = (
+                (getattr(u, "input_tokens", 0) or 0, getattr(u, "output_tokens", 0) or 0)
+                if u
+                else (0, 0)
+            )
             verdict.setdefault("verdict", "block")
             verdict.setdefault("category", "unknown")
             verdict.setdefault("reason", "")
@@ -645,15 +679,21 @@ async def classify(
         }
 
     verdict = None
+    total_in = total_out = 0
     for data, media_type in frames:
         verdict = await _classify_one(data, media_type, sensitivity, allowances)
+        fin, fout = verdict.get("usage", (0, 0))
+        total_in += fin
+        total_out += fout
         if verdict.get("verdict") == "block":
             break  # one bad frame is enough
 
     # Never cache a transient failure, or a brief outage would keep returning it for
-    # the rest of the session.
+    # the rest of the session. Cache WITHOUT the usage key so a later cache hit (which
+    # makes no API call) reports zero cost instead of re-charging the original tokens.
     if not verdict.get("error"):
-        _cache_put(cache_key, verdict)
+        _cache_put(cache_key, {k: v for k, v in verdict.items() if k != "usage"})
+    verdict["usage"] = (total_in, total_out)
     return verdict
 
 
@@ -1665,7 +1705,9 @@ async def _run_moderation(
                         "error": False,
                     }
         fresh += 1
-        return await classify(raw, mime, sensitivity, allowances)
+        v = await classify(raw, mime, sensitivity, allowances)
+        _record_cost(cfg, v.get("usage"))  # meter real tokens against this guild
+        return v
 
     results = await asyncio.gather(
         *(verdict_for(mime, raw) for _, mime, raw in payloads)
@@ -2355,12 +2397,19 @@ async def _chat_reply(message: discord.Message) -> None:
         async with message.channel.typing():
             msgs = history
             resp = None
+            tin = tout = 0
             for _ in range(3):  # resume across any web-search pause
                 async with check_semaphore:
                     resp = await claude.messages.create(messages=msgs, **kwargs)
+                u = _usage_of(resp)
+                tin += u[0]
+                tout += u[1]
                 if resp.stop_reason != "pause_turn":
                     break
                 msgs = msgs + [{"role": "assistant", "content": resp.content}]
+            if message.guild:
+                _record_cost(state.guild(message.guild.id), (tin, tout))
+                state.save()
             answer = _extract_answer(resp)
     except Exception:
         log.exception("chat reply failed")
@@ -2376,6 +2425,14 @@ async def _chat_reply(message: discord.Message) -> None:
         )
     except discord.HTTPException:
         log.warning("could not send chat reply in #%s", message.channel)
+
+
+def _usage_of(resp) -> tuple[int, int]:
+    """(input, output) tokens from a response, or (0, 0) if unavailable."""
+    u = getattr(resp, "usage", None)
+    if not u:
+        return (0, 0)
+    return (getattr(u, "input_tokens", 0) or 0, getattr(u, "output_tokens", 0) or 0)
 
 
 def _extract_answer(resp) -> str:
@@ -2443,12 +2500,18 @@ async def ask_cmd(
     try:
         messages = [{"role": "user", "content": q}]
         resp = None
+        tin = tout = 0
         for _ in range(3):  # a web search may pause the turn; resume until it's done
             async with check_semaphore:  # shares the rate-limit budget with scanning
                 resp = await claude.messages.create(messages=messages, **kwargs)
+            u = _usage_of(resp)
+            tin += u[0]
+            tout += u[1]
             if resp.stop_reason != "pause_turn":
                 break
             messages.append({"role": "assistant", "content": resp.content})
+        _record_cost(state.guild(interaction.guild_id), (tin, tout))
+        state.save()
         answer = _extract_answer(resp)
     except Exception:
         log.exception("/ask failed")
@@ -2741,6 +2804,11 @@ def _today() -> str:
     return discord.utils.utcnow().date().isoformat()
 
 
+def _fmt_usd(amount: float) -> str:
+    # sub-cent amounts are common per server, so keep 4 decimals until it's real money
+    return f"${amount:,.2f}" if amount >= 1 else f"${amount:.4f}"
+
+
 def _config_issues(gid: int, cfg: dict) -> list[str]:
     """Human-readable misconfigurations that would silently break moderation."""
     issues = []
@@ -2812,9 +2880,11 @@ def _admin_page(token: str) -> str:
         if (cfg := state.guild(g.id)).get("scan_day") == today
     )
     n_issues = sum(1 for g in bot.guilds if _config_issues(g.id, state.guild(g.id)))
+    total_spend = sum(state.guild(g.id).get("spend_usd", 0.0) for g in bot.guilds)
     summary = (
         f"<p><b>{len(bot.guilds)}</b> servers · <b>{n_premium}</b> premium · "
         f"<b>{scans_today}</b> scans today · "
+        f"<b>{_fmt_usd(total_spend)}</b> Claude cost · "
         + (
             f"<span class=warn><b>{n_issues}</b> with config issues</span>"
             if n_issues
@@ -2835,18 +2905,21 @@ def _admin_page(token: str) -> str:
             if issues
             else "✓"
         )
+        cost = _fmt_usd(state.guild(g.id).get("spend_usd", 0.0))
         rows += (
             f"<tr><td>{_esc(g.name)}</td><td><code>{g.id}</code></td>"
             f"<td>{g.member_count or '?'}</td><td>{badge}</td><td>{health}</td>"
+            f"<td>{cost}</td>"
             f"<td>{_premium_form(token, g.id)}</td><td>{settings_link(g.id)}</td></tr>"
         )
     # allowlisted ids the bot isn't currently in
     extra = ""
     for gid in state.allowlist():
         if int(gid) not in in_guild:
+            cost = _fmt_usd(state.guild(int(gid)).get("spend_usd", 0.0))
             extra += (
                 f"<tr><td><em>not joined</em></td><td><code>{_esc(gid)}</code></td>"
-                f"<td>—</td><td>✅ premium</td><td>—</td>"
+                f"<td>—</td><td>✅ premium</td><td>—</td><td>{cost}</td>"
                 f"<td>{_premium_form(token, int(gid))}</td>"
                 f"<td>{settings_link(int(gid))}</td></tr>"
             )
@@ -2857,7 +2930,7 @@ def _admin_page(token: str) -> str:
 <p>Grant premium (all categories + enforcement) or open <b>Settings</b> to change any
 per-server knob.</p>
 <table><tr><th>Server</th><th>ID</th><th>Members</th><th>Tier</th><th>Health</th>
-<th>Premium</th><th>Config</th></tr>
+<th>Claude cost</th><th>Premium</th><th>Config</th></tr>
 {rows}{extra}</table>
 <h3>Add a server by ID</h3>
 <form method=post action='/set?token={_esc(token)}'>
@@ -2912,6 +2985,9 @@ def _guild_settings_page(token: str, gid: int) -> str:
         else ""
     )
     used = cfg.get("scan_count", 0) if cfg.get("scan_day") == _today() else 0
+    spend_usd = cfg.get("spend_usd", 0.0)
+    spend_in = cfg.get("spend_in", 0)
+    spend_out = cfg.get("spend_out", 0)
     allow_text = _esc("\n".join(cfg.get("allowances", [])))
     activity_html = _audit_table(_read_audit(15, gid))
 
@@ -2962,6 +3038,13 @@ excuses anything else.</p>
 <form method=post action='/guild/quota-reset?token={_esc(token)}'>
 <input type=hidden name=guild_id value='{gid}'>
 <button>Reset today's quota</button></form>
+</fieldset>
+<fieldset><legend>Claude cost (lifetime)</legend>
+<p><b>{_fmt_usd(spend_usd)}</b> metered for this server.
+<span class=note>{spend_in:,} input + {spend_out:,} output tokens, priced at
+${PRICE_IN_PER_MTOK:g}/${PRICE_OUT_PER_MTOK:g} per million.</span></p>
+<p class=note>Metered from the real token counts Claude returns on each call (image scans,
+/ask, and chat). Cache hits and near-duplicate re-blocks make no API call and cost nothing.</p>
 </fieldset>
 <h3>Recent activity (this server)</h3>
 {activity_html}"""
