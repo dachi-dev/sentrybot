@@ -91,9 +91,10 @@ def _record_cost(cfg: dict, usage: "tuple[int, int] | None") -> None:
 STATE_PATH = Path(os.getenv("SENTRY_STATE", "sentry_state.json"))
 RESTRICTED_ROLE_NAME = "Media Restricted"
 
-# Long edge we downscale to before sending to Claude. 768px is plenty for
-# nudity/gore classification and costs ~800 input tokens per image.
-MAX_EDGE = int(os.getenv("SENTRY_MAX_EDGE", "768"))
+# Long edge we downscale to before sending to Claude. Cost scales with pixel area, so
+# this is the main cost lever: 640px is still ample for nudity/gore classification while
+# cutting image input tokens ~30% vs 768px. Raise for more fidelity, lower for less cost.
+MAX_EDGE = int(os.getenv("SENTRY_MAX_EDGE", "640"))
 
 # Hard ceiling from the API: 5 MB per base64 image, 8000x8000 px.
 API_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
@@ -474,7 +475,7 @@ def _cache_put(key: str, value: dict) -> None:
         verdict_cache.popitem(last=False)
 
 
-GIF_SAMPLE_FRAMES = max(1, int(os.getenv("SENTRY_GIF_FRAMES", "4")))
+GIF_SAMPLE_FRAMES = max(1, int(os.getenv("SENTRY_GIF_FRAMES", "3")))
 
 
 def _sniff_mime(raw: bytes) -> str | None:
