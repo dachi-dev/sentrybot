@@ -2765,7 +2765,74 @@ bot.tree.add_command(mod)
 
 ADMIN_TOKEN = os.getenv("SENTRY_ADMIN_TOKEN", "")
 ADMIN_BIND = os.getenv("SENTRY_ADMIN_BIND", "127.0.0.1:8899")
+# Org-scoped Admin key (sk-ant-admin...) — enables pulling the REAL account-wide Claude
+# bill from Anthropic's Cost API. Different from the regular API key; create it in the
+# Console (Settings > Admin keys). Optional: without it, only per-server metering shows.
+ADMIN_API_KEY = os.getenv("SENTRY_ADMIN_API_KEY", "")
+_COST_URL = "https://api.anthropic.com/v1/organizations/cost_report"
+_bill_cache: dict = {"at": 0.0, "html": None}  # cache the bill ~5 min (API is org-wide)
+BILL_TTL = 300.0
 _admin_runner: "web.AppRunner | None" = None
+
+
+async def _fetch_account_bill() -> str:
+    """Month-to-date Claude spend for the WHOLE org, live from Anthropic's Cost API.
+    Returns an HTML snippet. The API reports amounts as decimal strings in cents, so we
+    sum and divide by 100. Whole-account (every API key), not just this bot."""
+    now = discord.utils.utcnow()
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    params = {
+        "starting_at": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "bucket_width": "1d",
+        "limit": 31,
+    }
+    headers = {"x-api-key": ADMIN_API_KEY, "anthropic-version": "2023-06-01"}
+    total_cents = 0.0
+    try:
+        async with aiohttp.ClientSession() as sess:
+            page = None
+            for _ in range(12):  # bounded pagination
+                q = dict(params, **({"page": page} if page else {}))
+                async with sess.get(
+                    _COST_URL, params=q, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    if r.status != 200:
+                        return (
+                            f"<span class=warn>account bill unavailable (HTTP {r.status}"
+                            " — check SENTRY_ADMIN_API_KEY)</span>"
+                        )
+                    data = await r.json()
+                for bucket in data.get("data", []):
+                    for item in bucket.get("results", []):
+                        try:
+                            total_cents += float(item.get("amount") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                page = data.get("next_page") if data.get("has_more") else None
+                if not page:
+                    break
+    except Exception:
+        log.exception("cost report fetch failed")
+        return "<span class=warn>account bill unavailable (fetch error)</span>"
+    label = start.strftime("since %b %-d")
+    return (
+        f"<b>{_fmt_usd(total_cents / 100.0)}</b> total account Claude bill "
+        f"<span class=note>({label}, whole org across every API key, live from "
+        f"Anthropic's Cost API)</span>"
+    )
+
+
+async def _account_bill_line() -> str:
+    """Cached wrapper around _fetch_account_bill (empty if no admin key set)."""
+    if not ADMIN_API_KEY:
+        return ""
+    now = time.monotonic()
+    if _bill_cache["html"] is not None and now - _bill_cache["at"] < BILL_TTL:
+        return _bill_cache["html"]
+    html = await _fetch_account_bill()
+    _bill_cache.update(at=now, html=html)
+    return html
 
 
 def _admin_authed(request: "web.Request") -> bool:
@@ -2871,7 +2938,7 @@ def _audit_table(records: list[dict], show_guild: bool = False) -> str:
     return f"<table>{head}{body}</table>"
 
 
-def _admin_page(token: str) -> str:
+def _admin_page(token: str, bill_line: str = "") -> str:
     in_guild = {g.id: g for g in bot.guilds}
     today = _today()
     n_premium = sum(1 for g in bot.guilds if state.is_allowed(g.id))
@@ -2885,7 +2952,7 @@ def _admin_page(token: str) -> str:
     summary = (
         f"<p><b>{len(bot.guilds)}</b> servers · <b>{n_premium}</b> premium · "
         f"<b>{scans_today}</b> scans today · "
-        f"<b>{_fmt_usd(total_spend)}</b> Claude cost · "
+        f"<b>{_fmt_usd(total_spend)}</b> metered by this bot · "
         + (
             f"<span class=warn><b>{n_issues}</b> with config issues</span>"
             if n_issues
@@ -2928,6 +2995,7 @@ def _admin_page(token: str) -> str:
 <title>Sentry admin</title>{_ADMIN_STYLE}
 <h2>Sentry — servers</h2>
 {summary}
+{f"<p>💳 {bill_line}</p>" if bill_line else ""}
 <p>Grant premium (all categories + enforcement) or open <b>Settings</b> to change any
 per-server knob.</p>
 <table><tr><th>Server</th><th>ID</th><th>Members</th><th>Tier</th><th>Health</th>
@@ -3059,8 +3127,10 @@ def _parse_id(raw: str):
 async def _admin_index(request: "web.Request") -> "web.Response":
     if not _admin_authed(request):
         return web.Response(status=401, text="unauthorized")
+    bill_line = await _account_bill_line()
     return web.Response(
-        text=_admin_page(request.query.get("token", "")), content_type="text/html"
+        text=_admin_page(request.query.get("token", ""), bill_line),
+        content_type="text/html",
     )
 
 

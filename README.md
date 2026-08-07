@@ -238,7 +238,7 @@ slash commands:
 - **Overview** (`/`) — all servers with tier, member count, a **health** flag (⚠️ if a
   server is misconfigured, e.g. enabled with no review channel), each server's **Claude
   cost**, premium grant/revoke, and a totals line (server count, premium count, scans
-  today, total Claude cost).
+  today, total metered cost, and — if an Admin key is set — the real account bill).
 - **Per-server settings** (`/guild?id=…`) — every knob a server admin can change:
   scanning on/off, enforce vs. watch-only, sensitivity, confidence threshold, each
   category on/off, and the review-channel / restricted-role / alert-role / excluded-channel
@@ -251,6 +251,12 @@ slash commands:
   near-duplicate re-blocks make no API call and cost nothing. Anthropic bills per account,
   not per Discord server, so this self-metering is the only way to attribute spend per
   guild — the billing API can't split it out.
+- **Account bill** — set `SENTRY_ADMIN_API_KEY` to an org **Admin key** (`sk-ant-admin…`,
+  created in Console → Admin keys) and the overview also shows your **real month-to-date
+  Claude bill** pulled live from Anthropic's [Cost API](https://platform.claude.com/docs/en/manage-claude/usage-cost-api)
+  (cached ~5 min). This is the **whole organization** across every API key — not just this
+  bot — so it's the number to reconcile against your invoice, distinct from the per-server
+  metered figures above.
 - **Activity** (`/activity`) — the recent audit trail across all servers (removals, check
   failures, dry-run flags, moderator actions), newest first.
 
