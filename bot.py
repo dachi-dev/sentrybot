@@ -2121,7 +2121,7 @@ async def staffbypass_cmd(
 
 @mod.command(
     name="chat",
-    description="Whether the bot's AI chat (@mentions, replies, and /ask) works in this server",
+    description="Whether the bot's chat (@mentions, replies, and /ask) works in this server",
 )
 @app_commands.choices(
     mode=[
@@ -2135,7 +2135,7 @@ async def chat_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
     state.save()
     if cfg["chat_enabled"]:
         msg = (
-            "AI chat is **ON** — I'll reply when @mentioned or replied to, and `/ask` works."
+            "Chat is **ON** — I'll reply when @mentioned or replied to, and `/ask` works."
         )
         if not ASK_CHAT:
             msg += (
@@ -2144,7 +2144,7 @@ async def chat_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
             )
     else:
         msg = (
-            "AI chat is **OFF** — I won't reply to @mentions or replies, and `/ask` is "
+            "Chat is **OFF** — I won't reply to @mentions or replies, and `/ask` is "
             "disabled here. Image moderation still works."
         )
     await interaction.response.send_message(msg, ephemeral=True)
@@ -2518,7 +2518,7 @@ async def ask_cmd(
     # /ask shares the chat toggle: off (per-server or the global master switch) disables it.
     if not ASK_CHAT or not state.guild(interaction.guild_id).get("chat_enabled", True):
         await interaction.response.send_message(
-            "The AI chat feature (including `/ask`) is turned off in this server.",
+            "Chat is turned off in this server, so `/ask` isn't available here.",
             ephemeral=True,
         )
         return
@@ -2599,7 +2599,7 @@ async def status_cmd(interaction: discord.Interaction):
     embed.add_field(name="Sensitivity", value=cfg["sensitivity"])
     chat_on = cfg.get("chat_enabled", True)
     embed.add_field(
-        name="AI chat & /ask",
+        name="Chat & /ask",
         value=("on" if chat_on else "off")
         + ("" if ASK_CHAT else " (globally disabled)"),
     )
@@ -3054,7 +3054,7 @@ def _guild_settings_page(token: str, gid: int) -> str:
 <label><input type=checkbox name=exempt_reviewers{checked(cfg.get('exempt_reviewers', True))}>
   Staff bypass — don't moderate anyone who can see the review channel (uncheck to test on staff)</label>
 <label><input type=checkbox name=chat_enabled{checked(cfg.get('chat_enabled', True))}>
-  AI chat — reply to @mentions/replies and allow /ask{'' if ASK_CHAT else ' (globally OFF via SENTRY_ASK_CHAT)'}</label>
+  Chat — reply to @mentions/replies and allow /ask{'' if ASK_CHAT else ' (globally OFF via SENTRY_ASK_CHAT)'}</label>
 <label>Sensitivity (what Claude flags):
   <select name=sensitivity>{sel(SENSITIVITY_LEVELS, cfg.get('sensitivity', 'standard'))}</select></label>
 <label>Threshold (confidence to act):
