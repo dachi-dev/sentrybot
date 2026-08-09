@@ -213,6 +213,7 @@ _GUILD_DEFAULTS: dict[str, Any] = {
     "alert_role": None,  # role pinged on every removal
     "allowances": list,  # community-specific exceptions injected into the prompt
     "exempt_reviewers": True,  # skip anyone who can see the review channel (staff)
+    "chat_enabled": True,  # reply to @mentions/replies here (gated by global SENTRY_ASK_CHAT)
     "spend_in": 0,  # lifetime input tokens billed to this guild (real resp.usage)
     "spend_out": 0,  # lifetime output tokens billed to this guild
     "spend_usd": 0.0,  # lifetime USD spend = tokens x the configured rate
@@ -1378,11 +1379,12 @@ def _guild_scans(message: discord.Message, cfg: dict) -> bool:
 async def on_message(message: discord.Message):
     if message.guild is None or message.author.bot:
         return
-    # Chatbot: reply when the bot is @mentioned or replied to (independent of moderation
-    # settings). Walks the reply chain for context — see _chat_reply.
-    if ASK_CHAT and _is_chat_trigger(message):
-        asyncio.create_task(_chat_reply(message))
     cfg = state.guild(message.guild.id)
+    # Chatbot: reply when the bot is @mentioned or replied to (independent of moderation
+    # settings). Per-server toggle, gated by the global SENTRY_ASK_CHAT master switch.
+    # Walks the reply chain for context — see _chat_reply.
+    if ASK_CHAT and cfg.get("chat_enabled", True) and _is_chat_trigger(message):
+        asyncio.create_task(_chat_reply(message))
     # Attachments and stickers are here now; link/GIF embeds usually arrive a moment
     # later via a message edit (handled in on_message_edit).
     if _guild_scans(message, cfg) and (
@@ -2117,6 +2119,35 @@ async def staffbypass_cmd(
     )
 
 
+@mod.command(
+    name="chat",
+    description="Whether the bot chats back when @mentioned or replied to in this server",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="on — replies to @mentions and replies (default)", value="on"),
+        app_commands.Choice(name="off — stays silent unless a slash command is used", value="off"),
+    ]
+)
+async def chat_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    cfg = state.guild(interaction.guild.id)
+    cfg["chat_enabled"] = mode.value == "on"
+    state.save()
+    if cfg["chat_enabled"]:
+        msg = "Chatbot is **ON** — I'll reply when @mentioned or replied to here."
+        if not ASK_CHAT:
+            msg += (
+                "\n\n⚠️ Note: chat is **globally disabled** on this bot "
+                "(`SENTRY_ASK_CHAT`), so this won't take effect until that's turned on."
+            )
+    else:
+        msg = (
+            "Chatbot is **OFF** — I won't reply to @mentions or replies here. "
+            "Image moderation and slash commands like `/ask` still work."
+        )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 @mod.command(name="allowlist", description="(bot owner only) Grant/revoke a server's premium access")
 @app_commands.describe(guild_id="The server ID", action="Add or remove premium access")
 @app_commands.choices(
@@ -2557,6 +2588,12 @@ async def status_cmd(interaction: discord.Interaction):
         name="Scans today", value=f"{used}" if premium else f"{used}/{FREE_SCAN_LIMIT}"
     )
     embed.add_field(name="Sensitivity", value=cfg["sensitivity"])
+    chat_on = cfg.get("chat_enabled", True)
+    embed.add_field(
+        name="Chatbot",
+        value=("on" if chat_on else "off")
+        + ("" if ASK_CHAT else " (globally disabled)"),
+    )
     embed.add_field(name="Model", value=MODEL, inline=False)
     embed.add_field(
         name="Review channel",
@@ -3007,6 +3044,8 @@ def _guild_settings_page(token: str, gid: int) -> str:
   Enforce — remove flagged images (unchecked = watch-only / dry run)</label>
 <label><input type=checkbox name=exempt_reviewers{checked(cfg.get('exempt_reviewers', True))}>
   Staff bypass — don't moderate anyone who can see the review channel (uncheck to test on staff)</label>
+<label><input type=checkbox name=chat_enabled{checked(cfg.get('chat_enabled', True))}>
+  Chatbot — reply when @mentioned or replied to{'' if ASK_CHAT else ' (globally OFF via SENTRY_ASK_CHAT)'}</label>
 <label>Sensitivity (what Claude flags):
   <select name=sensitivity>{sel(SENSITIVITY_LEVELS, cfg.get('sensitivity', 'standard'))}</select></label>
 <label>Threshold (confidence to act):
@@ -3098,6 +3137,7 @@ async def _admin_guild_save(request: "web.Request") -> "web.Response":
     cfg["enabled"] = "enabled" in data
     cfg["dry_run"] = "enforce" not in data
     cfg["exempt_reviewers"] = "exempt_reviewers" in data
+    cfg["chat_enabled"] = "chat_enabled" in data
     if data.get("sensitivity") in SENSITIVITY_LEVELS:
         cfg["sensitivity"] = data.get("sensitivity")
     if data.get("threshold") in CONFIDENCE_LEVELS:

@@ -43,6 +43,7 @@ edit history. Single file, no database, ~550 input tokens per image at the defau
 | `/sentry allowlist` | **(bot owner only)** grant/revoke a server's premium access by ID |
 | `/sentry exclude` | Exclude a channel from scanning, or re-include it (NSFW channels, mod-only rooms) |
 | `/sentry staffbypass` | `on`/`off` — whether review-channel viewers (staff) are exempt from moderation |
+| `/sentry chat` | `on`/`off` — whether the bot chats back when @mentioned or replied to |
 | `/sentry toggle` | Kill switch for the whole server |
 | `/sentry status` | Current config |
 | `/sentry restrict` / `unrestrict` | Manual permission control |
@@ -241,8 +242,8 @@ slash commands:
   today, total Claude cost).
 - **Per-server settings** (`/guild?id=…`) — every knob a server admin can change:
   scanning on/off, enforce vs. watch-only, sensitivity, confidence threshold, each
-  category on/off, and the review-channel / restricted-role / alert-role / excluded-channel
-  bindings (by ID). Also shows that server's free-tier quota with a **reset** button, its
+  category on/off, the **chatbot** on/off (reply to @mentions/replies), and the
+  review-channel / restricted-role / alert-role / excluded-channel bindings (by ID). Also shows that server's free-tier quota with a **reset** button, its
   **lifetime Claude cost** (with the token breakdown), and its recent moderation activity.
 
   Cost is **metered from the real token counts** Claude returns on every call — image
