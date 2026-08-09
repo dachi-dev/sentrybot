@@ -2121,12 +2121,12 @@ async def staffbypass_cmd(
 
 @mod.command(
     name="chat",
-    description="Whether the bot chats back when @mentioned or replied to in this server",
+    description="Whether the bot's AI chat (@mentions, replies, and /ask) works in this server",
 )
 @app_commands.choices(
     mode=[
-        app_commands.Choice(name="on — replies to @mentions and replies (default)", value="on"),
-        app_commands.Choice(name="off — stays silent unless a slash command is used", value="off"),
+        app_commands.Choice(name="on — replies to @mentions/replies and /ask works (default)", value="on"),
+        app_commands.Choice(name="off — no chat replies and /ask is disabled here", value="off"),
     ]
 )
 async def chat_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
@@ -2134,7 +2134,9 @@ async def chat_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
     cfg["chat_enabled"] = mode.value == "on"
     state.save()
     if cfg["chat_enabled"]:
-        msg = "Chatbot is **ON** — I'll reply when @mentioned or replied to here."
+        msg = (
+            "AI chat is **ON** — I'll reply when @mentioned or replied to, and `/ask` works."
+        )
         if not ASK_CHAT:
             msg += (
                 "\n\n⚠️ Note: chat is **globally disabled** on this bot "
@@ -2142,8 +2144,8 @@ async def chat_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
             )
     else:
         msg = (
-            "Chatbot is **OFF** — I won't reply to @mentions or replies here. "
-            "Image moderation and slash commands like `/ask` still work."
+            "AI chat is **OFF** — I won't reply to @mentions or replies, and `/ask` is "
+            "disabled here. Image moderation still works."
         )
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -2513,6 +2515,13 @@ async def ask_cmd(
     if not q:
         await interaction.response.send_message("Say something first.", ephemeral=True)
         return
+    # /ask shares the chat toggle: off (per-server or the global master switch) disables it.
+    if not ASK_CHAT or not state.guild(interaction.guild_id).get("chat_enabled", True):
+        await interaction.response.send_message(
+            "The AI chat feature (including `/ask`) is turned off in this server.",
+            ephemeral=True,
+        )
+        return
     wait = ASK_COOLDOWN - (time.monotonic() - _ask_last.get(interaction.user.id, 0.0))
     if wait > 0:
         await interaction.response.send_message(
@@ -2590,7 +2599,7 @@ async def status_cmd(interaction: discord.Interaction):
     embed.add_field(name="Sensitivity", value=cfg["sensitivity"])
     chat_on = cfg.get("chat_enabled", True)
     embed.add_field(
-        name="Chatbot",
+        name="AI chat & /ask",
         value=("on" if chat_on else "off")
         + ("" if ASK_CHAT else " (globally disabled)"),
     )
@@ -3045,7 +3054,7 @@ def _guild_settings_page(token: str, gid: int) -> str:
 <label><input type=checkbox name=exempt_reviewers{checked(cfg.get('exempt_reviewers', True))}>
   Staff bypass — don't moderate anyone who can see the review channel (uncheck to test on staff)</label>
 <label><input type=checkbox name=chat_enabled{checked(cfg.get('chat_enabled', True))}>
-  Chatbot — reply when @mentioned or replied to{'' if ASK_CHAT else ' (globally OFF via SENTRY_ASK_CHAT)'}</label>
+  AI chat — reply to @mentions/replies and allow /ask{'' if ASK_CHAT else ' (globally OFF via SENTRY_ASK_CHAT)'}</label>
 <label>Sensitivity (what Claude flags):
   <select name=sensitivity>{sel(SENSITIVITY_LEVELS, cfg.get('sensitivity', 'standard'))}</select></label>
 <label>Threshold (confidence to act):
